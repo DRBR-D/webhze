@@ -63,12 +63,23 @@ let favoriteIdSet = new Set();
 
 const appMain = document.getElementById('app-main');
 const appShell = document.getElementById('app-shell');
+const appStage = document.querySelector('.app-stage');
 const topHeader = document.getElementById('top-header');
 const toolbarTitleEl = document.getElementById('toolbar-title');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const pointsBadge = document.getElementById('header-points-value');
 const rewardsDialog = document.getElementById('rewards-dialog');
 const rewardsDialogBody = document.getElementById('rewards-dialog-body');
+
+const supportsWebInstall = typeof Navigator !== 'undefined' && typeof Navigator.prototype?.install === 'function';
+let deferredInstallPrompt = null;
+
+function isStandaloneMode() {
+  return (
+    window.navigator.standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches
+  );
+}
 
 const ROUTE_TITLES = {
   home: 'Khám phá',
@@ -503,7 +514,7 @@ async function mountHomeView(container) {
         loadMoreHome();
       }
     },
-    { rootMargin: '400px 0px' }
+    { root: isStandaloneMode() ? appStage : null, rootMargin: '400px 0px' }
   );
   io.observe(sentinel);
   cleanups.push(() => io.disconnect());
@@ -739,7 +750,7 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
     (entries) => {
       if (entries.some((e) => e.isIntersecting)) loadMoreSearch();
     },
-    { rootMargin: '400px 0px' }
+    { root: isStandaloneMode() ? appStage : null, rootMargin: '400px 0px' }
   );
   io.observe(sentinel);
   cleanups.push(() => io.disconnect());
@@ -1410,7 +1421,62 @@ function renderRewardsDialogContent() {
           );
         })
       )
-    )
+    ),
+
+    // Native Web Install section (shown ONLY when install API or prompt is available & not standalone)
+    buildInstallAppSection()
+  );
+}
+
+function buildInstallAppSection() {
+  const canInstall = !isStandaloneMode() && (supportsWebInstall || Boolean(deferredInstallPrompt));
+  if (!canInstall) return null;
+
+  const statusText = el('p', { className: 'setting-hint', role: 'status', 'aria-live': 'polite' });
+  const installBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'btn btn-primary',
+      onClick: async () => {
+        if (installBtn.getAttribute('aria-disabled') === 'true') return;
+        installBtn.setAttribute('aria-disabled', 'true');
+        try {
+          if (supportsWebInstall) {
+            await navigator.install();
+            statusText.textContent = 'Đã cài đặt hoặc mở ứng dụng MangaFlow.';
+            installBtn.hidden = true;
+          } else if (deferredInstallPrompt) {
+            const promptEvent = deferredInstallPrompt;
+            deferredInstallPrompt = null;
+            await promptEvent.prompt();
+            const { outcome } = await promptEvent.userChoice;
+            statusText.textContent =
+              outcome === 'accepted'
+                ? 'Đã thêm MangaFlow vào màn hình chính.'
+                : 'Đã hủy cài đặt.';
+            if (!deferredInstallPrompt) installBtn.hidden = true;
+          }
+        } catch (err) {
+          statusText.textContent =
+            err?.name === 'AbortError'
+              ? 'Đã hủy cài đặt.'
+              : 'Không thể bắt đầu cài đặt trên trình duyệt này.';
+        } finally {
+          installBtn.removeAttribute('aria-disabled');
+        }
+      },
+    },
+    svgIcon('download', 17),
+    'Cài ứng dụng ra màn hình chính'
+  );
+
+  return el(
+    'section',
+    { className: 'dialog-section' },
+    el('h3', {}, 'Ứng dụng toàn màn hình'),
+    installBtn,
+    statusText
   );
 }
 
@@ -1430,6 +1496,7 @@ async function renderRoute() {
   const route = parseRoute(window.location.pathname, window.location.search);
   updateActiveNav(route.name);
   window.scrollTo({ top: 0, behavior: 'instant' });
+  if (appStage) appStage.scrollTop = 0;
 
   await refreshFavoriteIds();
 
@@ -1477,12 +1544,69 @@ function boot() {
     toolbarSearchInput.blur();
   });
 
-  // Scroll-edge & iOS Large Title collapse detection
+  // Register app-shell Service Worker for Home Screen standalone & offline launch
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+
+  // Sync standalone display-mode class dynamically
+  const standaloneMql = window.matchMedia('(display-mode: standalone)');
+  const syncStandaloneClass = () => {
+    document.documentElement.classList.toggle('is-standalone', isStandaloneMode());
+  };
+  syncStandaloneClass();
+  standaloneMql.addEventListener?.('change', syncStandaloneClass);
+
+  // Capture Chromium beforeinstallprompt fallback per install-web-app guidance
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (rewardsDialog.open) renderRewardsDialogContent();
+  });
+
+  // Scroll-edge & iOS Large Title collapse detection (works in both browser & standalone scroll container)
   const updateScrollChrome = () => {
-    topHeader?.classList.toggle('is-scrolled', window.scrollY > 24);
+    const scrollPos = Math.max(window.scrollY, appStage?.scrollTop || 0);
+    topHeader?.classList.toggle('is-scrolled', scrollPos > 24);
   };
   window.addEventListener('scroll', updateScrollChrome, { passive: true });
+  appStage?.addEventListener('scroll', updateScrollChrome, { passive: true });
   updateScrollChrome();
+
+  // iOS native left-edge swipe-back gesture (crucial when Safari Back button is hidden in standalone mode)
+  let edgeSwipeStartX = 0;
+  let edgeSwipeStartY = 0;
+  let edgeSwipeActive = false;
+  document.addEventListener(
+    'touchstart',
+    (e) => {
+      if (e.touches.length !== 1) return;
+      if (appShell.classList.contains('is-reader-route') || rewardsDialog.open) return;
+      if (e.target.closest('.carousel-track, .quick-actions, input, select')) return;
+      const x = e.touches[0].clientX;
+      if (x <= 26) {
+        edgeSwipeActive = true;
+        edgeSwipeStartX = x;
+        edgeSwipeStartY = e.touches[0].clientY;
+      } else {
+        edgeSwipeActive = false;
+      }
+    },
+    { passive: true }
+  );
+  document.addEventListener(
+    'touchend',
+    (e) => {
+      if (!edgeSwipeActive || e.changedTouches.length !== 1) return;
+      edgeSwipeActive = false;
+      const dx = e.changedTouches[0].clientX - edgeSwipeStartX;
+      const dy = e.changedTouches[0].clientY - edgeSwipeStartY;
+      if (dx > 72 && Math.abs(dx) > Math.abs(dy) * 1.5 && window.location.pathname !== '/') {
+        window.history.back();
+      }
+    },
+    { passive: true }
+  );
 
   // macOS keyboard shortcuts (zero animation on keyboard-initiated actions)
   window.addEventListener('keydown', (e) => {

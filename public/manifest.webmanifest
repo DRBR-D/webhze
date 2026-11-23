@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "MangaFlow",
+  "short_name": "MangaFlow",
+  "description": "Trình đọc truyện phong cách iOS & macOS Liquid Glass.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#0B0B10",
+  "theme_color": "#0B0B10",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

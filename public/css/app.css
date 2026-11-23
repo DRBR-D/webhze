@@ -385,6 +385,61 @@ button, [role="button"], nav a, .chip-btn, .sheet-drag-zone {
   position: relative;
 }
 
+/* Installed Home-Screen Standalone App Mode (iOS Safari / Android Chrome / macOS Dock):
+   Lock the outer document viewport and scroll inside .app-stage so swiping up/down never
+   rubber-bands the page edge or exposes browser chrome. */
+@media (display-mode: standalone) {
+  html,
+  body {
+    position: fixed;
+    inset: 0;
+    inline-size: 100%;
+    block-size: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  .app-shell {
+    block-size: 100%;
+    min-block-size: 0;
+    overflow: hidden;
+  }
+  .app-stage {
+    block-size: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    scroll-padding-top: calc(var(--toolbar-height) + env(safe-area-inset-top, 0px) + 0.75rem);
+    scroll-padding-bottom: calc(var(--tabbar-clearance) + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+html.is-standalone,
+html.is-standalone body {
+  position: fixed;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+html.is-standalone .app-shell {
+  block-size: 100%;
+  min-block-size: 0;
+  overflow: hidden;
+}
+
+html.is-standalone .app-stage {
+  block-size: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  scroll-padding-top: calc(var(--toolbar-height) + env(safe-area-inset-top, 0px) + 0.75rem);
+  scroll-padding-bottom: calc(var(--tabbar-clearance) + env(safe-area-inset-bottom, 0px));
+}
+
 .app-shell.is-reader-route .mac-sidebar,
 .app-shell.is-reader-route .top-header,
 .app-shell.is-reader-route .mobile-bottom-nav,

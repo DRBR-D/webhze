@@ -175,10 +175,32 @@ test('HTTP server proxies API with required headers and serves SPA routes', asyn
   const badImg = await fetch(`${base}/api/img?url=${encodeURIComponent('http://127.0.0.1:80/secret')}`);
   assert.equal(badImg.status, 400);
 
-  // 4. SPA fallback serves index.html on deep routes
+  // 4. SPA fallback serves index.html on deep routes with iOS standalone meta tags
   const spaRes = await fetch(`${base}/read/101/4`);
   assert.equal(spaRes.status, 200);
   assert.equal(spaRes.headers.get('referrer-policy'), 'no-referrer');
   const html = await spaRes.text();
   assert.match(html, /<meta name="color-scheme" content="light dark">/);
+  assert.match(html, /<meta name="apple-mobile-web-app-capable" content="yes">/);
+  assert.match(html, /<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">/);
+  assert.match(html, /<link rel="manifest" href="\/manifest\.webmanifest">/);
+
+  // 5. Web App Manifest, Service Worker & Apple Touch Icon served cleanly for Home Screen install
+  const mfRes = await fetch(`${base}/manifest.webmanifest`);
+  assert.equal(mfRes.status, 200);
+  assert.match(mfRes.headers.get('content-type'), /application\/manifest\+json/);
+  const mf = await mfRes.json();
+  assert.equal(mf.id, '/');
+  assert.equal(mf.display, 'standalone');
+  assert.equal(mf.start_url, '/');
+
+  const swRes = await fetch(`${base}/sw.js`);
+  assert.equal(swRes.status, 200);
+  assert.equal(swRes.headers.get('service-worker-allowed'), '/');
+
+  const iconRes = await fetch(`${base}/icons/apple-touch-icon.png`);
+  assert.equal(iconRes.status, 200);
+  assert.equal(iconRes.headers.get('content-type'), 'image/png');
+  const iconBytes = new Uint8Array(await iconRes.arrayBuffer());
+  assert.deepEqual([...iconBytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
 });

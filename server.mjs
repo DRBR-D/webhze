@@ -27,6 +27,7 @@ const MIME_TYPES = {
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -183,12 +184,18 @@ async function serveStatic(res, pathname) {
   const ext = path.extname(targetFile).toLowerCase();
   const contentType = MIME_TYPES[ext] || 'application/octet-stream';
   const data = await fs.readFile(targetFile);
-  res.writeHead(200, {
+  const headers = {
     'Content-Type': contentType,
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
-    'Cache-Control': ['.html', '.css', '.js', '.mjs'].includes(ext) ? 'no-cache' : 'public, max-age=3600',
-  });
+    'Cache-Control': ['.html', '.css', '.js', '.mjs', '.webmanifest'].includes(ext)
+      ? 'no-cache'
+      : 'public, max-age=3600',
+  };
+  if (path.basename(targetFile) === 'sw.js') {
+    headers['Service-Worker-Allowed'] = '/';
+  }
+  res.writeHead(200, headers);
   res.end(data);
 }
 
