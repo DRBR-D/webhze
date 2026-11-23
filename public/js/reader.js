@@ -79,8 +79,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   let theme = prefs.theme; // 'black' | 'charcoal' | 'sepia' | 'white'
   let autoScrollSpeed = Math.min(5, Math.max(1, Number(prefs.autoScrollSpeed) || 2));
   let autoScrolling = false;
-  // Unobstructed by default: full-bleed manga reading; tap screen to open the Kinetic panel
+  // Start unobstructed; 1 single tap opens or closes the controls immediately
   let hudVisible = false;
+  let hudOpenedAt = 0;
   let zoom = 1;
   let panX = 0;
   let panY = 0;
@@ -160,7 +161,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   currentPage = Math.min(totalPages, Math.max(1, currentPage));
   const titleText = getBookTitle(book);
 
-  // --- Kinetic Reader Controls (00:54–01:09 reference) ---
+  // --- Clean Kinetic Reader HUD (matches video 00:54–01:09, fixed for 320px–360px phones) ---
   const topSubCounter = el('span', { className: 'reader-counter tabular-nums' }, `Page ${currentPage} of ${totalPages}`);
   const sliderCurNum = el('span', { className: 'reader-scrubber-cur tabular-nums' }, String(currentPage));
   const sliderTotNum = el('span', { className: 'reader-scrubber-tot tabular-nums' }, String(totalPages));
@@ -169,9 +170,12 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     'button',
     {
       type: 'button',
-      className: 'reader-mini-pill glass-clear tabular-nums',
+      className: 'reader-mini-pill tabular-nums',
       'aria-label': 'Hiện bảng điều khiển đọc truyện',
-      onClick: () => setHudVisible(true),
+      onClick: (e) => {
+        e.stopPropagation();
+        setHudVisible(true);
+      },
     },
     `${currentPage} / ${totalPages}`
   );
@@ -182,31 +186,51 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       type: 'button',
       className: 'reader-auto-pill',
       hidden: true,
-      onClick: () => setAutoScrolling(false),
+      onClick: (e) => {
+        e.stopPropagation();
+        setAutoScrolling(false);
+      },
     },
     el('span', { className: 'auto-dot', 'aria-hidden': 'true' }),
     el('span', { className: 'auto-pill-text' }, `Auto ${autoScrollSpeed}x · Tap to pause`)
   );
 
+  const zoomCycleBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'reader-zoom-pill tabular-nums',
+      'aria-label': 'Phóng to hoặc thu nhỏ ảnh',
+      title: 'Chạm để đổi mức phóng to (100% / 150% / 200%)',
+      onClick: () => {
+        if (zoom < 1.4) setZoom(1.5);
+        else if (zoom < 1.9) setZoom(2);
+        else setZoom(1);
+      },
+    },
+    '100%'
+  );
+
   const topBar = el(
     'header',
-    { className: 'reader-top-bar glass-clear' },
+    { className: 'reader-top-bar' },
     el(
       'button',
       {
         type: 'button',
-        className: 'icon-btn reader-hud-btn compact',
+        className: 'reader-back-btn',
         'aria-label': 'Quay lại chi tiết truyện',
         onClick: () => navigate(`/manga/${id}`),
       },
-      svgIcon('back', 19)
+      svgIcon('back', 20)
     ),
     el(
       'div',
       { className: 'reader-title-wrap' },
       el('h1', { className: 'reader-title' }, titleText),
       topSubCounter
-    )
+    ),
+    zoomCycleBtn
   );
 
   const pageSlider = el('input', {
@@ -260,18 +284,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       'aria-pressed': 'false',
       onClick: () => setAutoScrolling(!autoScrolling),
     },
-    svgIcon('play', 17)
-  );
-
-  const zoomResetBtn = el(
-    'button',
-    {
-      type: 'button',
-      className: 'zoom-mini-btn tabular-nums',
-      'aria-label': 'Đặt lại phóng to 100%',
-      onClick: () => setZoom(1),
-    },
-    '100%'
+    svgIcon('play', 16)
   );
 
   const speedButtons = AUTO_SPEEDS.map((sp) =>
@@ -294,7 +307,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
   const bottomPanel = el(
     'footer',
-    { className: 'reader-kinetic-panel glass-clear' },
+    { className: 'reader-kinetic-panel' },
     el(
       'div',
       { className: 'reader-scrubber-row' },
@@ -325,18 +338,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         'div',
         { className: 'kinetic-auto-head' },
         el('div', { className: 'kinetic-auto-left' }, autoPlayBtn, el('strong', {}, 'Auto-Scroll')),
-        el(
-          'div',
-          { className: 'kinetic-auto-right' },
-          el(
-            'div',
-            { className: 'zoom-mini-group', role: 'group', 'aria-label': 'Thu phóng' },
-            el('button', { type: 'button', className: 'zoom-mini-btn', 'aria-label': 'Thu nhỏ', onClick: () => setZoom(zoom - 0.25) }, '−'),
-            zoomResetBtn,
-            el('button', { type: 'button', className: 'zoom-mini-btn', 'aria-label': 'Phóng to', onClick: () => setZoom(zoom + 0.25) }, '+')
-          ),
-          autoStatusLabel
-        )
+        autoStatusLabel
       ),
       el('div', { className: 'kinetic-speed-row' }, ...speedButtons)
     )
@@ -363,7 +365,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
   function setHudVisible(visible) {
     hudVisible = visible;
-    if (visible && viewport) lastHudScrollTop = viewport.scrollTop;
+    if (visible) {
+      hudOpenedAt = performance.now();
+      if (viewport) lastHudScrollTop = viewport.scrollTop;
+    }
     root.classList.toggle('hud-hidden', !hudVisible);
   }
 
@@ -382,11 +387,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       panY = 0;
     }
     stage.style.transition = '';
-    stage.style.transform = zoom > 1
-      ? `translate3d(${panX.toFixed(1)}px, ${panY.toFixed(1)}px, 0) scale(${zoom})`
-      : '';
+    stage.style.transform =
+      zoom > 1 ? `translate3d(${panX.toFixed(1)}px, ${panY.toFixed(1)}px, 0) scale(${zoom})` : '';
     viewport.classList.toggle('is-zoomed', zoom > 1);
-    zoomResetBtn.textContent = `${Math.round(zoom * 100)}%`;
+    zoomCycleBtn.textContent = `${Math.round(zoom * 100)}%`;
   }
 
   function setZoom(nextZoom) {
@@ -472,26 +476,29 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       );
       for (const frame of list.children) observer.observe(frame);
     } else {
-      renderHorizontalPage();
+      renderHorizontalPage(0);
     }
   }
 
-  function renderHorizontalPage() {
+  function renderHorizontalPage(direction = 0) {
     revokeObjectUrls(stage);
     const p = pages[currentPage - 1];
     if (!p) return;
+    const animClass =
+      direction > 0 ? 'page-fly-next' : direction < 0 ? 'page-fly-prev' : 'page-fly-in';
     stage.replaceChildren(
-      el('div', { className: 'reader-horizontal-frame' }, createPageImg(p, book.media_id, 'high'))
+      el('div', { className: `reader-horizontal-frame ${animClass}` }, createPageImg(p, book.media_id, 'high'))
     );
   }
 
   function goToPage(targetPage) {
     const clamped = Math.min(totalPages, Math.max(1, targetPage));
+    const dir = clamped > currentPage ? 1 : clamped < currentPage ? -1 : 0;
     if (clamped === currentPage && mode === 'horizontal' && stage.children.length > 0) return;
     persistCurrentPage(clamped);
     if (mode === 'horizontal') {
       setZoom(1);
-      renderHorizontalPage();
+      renderHorizontalPage(dir);
     } else {
       const targetEl = stage.querySelector(`[data-page="${clamped}"]`);
       if (targetEl) viewport.scrollTo({ top: targetEl.offsetTop, behavior: 'auto' });
@@ -549,7 +556,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     stopAutoScrollLoops();
     autoPlayBtn.setAttribute('aria-pressed', String(autoScrolling));
     autoPlayBtn.classList.toggle('active', autoScrolling);
-    autoPlayBtn.replaceChildren(svgIcon(autoScrolling ? 'pause' : 'play', 17));
+    autoPlayBtn.replaceChildren(svgIcon(autoScrolling ? 'pause' : 'play', 16));
     autoStatusLabel.textContent = autoScrolling ? `${autoScrollSpeed}x Active` : 'Paused';
     autoStatusLabel.classList.toggle('active', autoScrolling);
     autoActiveBanner.hidden = !autoScrolling;
@@ -565,26 +572,69 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     }
   }
 
-  // --- Gestures: Pinch-Zoom, Pan, 1:1 Horizontal Swipe, Double-Tap, Auto-Hide on Scroll ---
+  // --- Rock-Solid Single-Tap Menu Toggle (0ms lag, NEVER double-fires on mobile!) ---
   let pinchStartDist = 0;
   let pinchStartZoom = 1;
   let touchStartX = 0;
   let touchStartY = 0;
+  let touchStartTime = 0;
   let touchStartPanX = 0;
   let touchStartPanY = 0;
   let touchMoved = false;
+  let wasMultiTouch = false;
   let horizDragging = false;
   let horizDragX = 0;
   let touchSamples = [];
-  let lastTapTime = 0;
-  let tapTimer = 0;
+  let lastTouchEndTime = -1000;
+
+  // Double-tap zoom state (instant 1st tap toggles HUD; 2nd rapid tap zooms & reverts HUD)
+  let prevTapTime = -1000;
+  let prevTapX = 0;
+  let prevTapY = 0;
+  let hudBeforeFirstTap = false;
 
   function touchDist(t1, t2) {
     return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
   }
 
+  function handleSingleTapInstant(clientX, clientY) {
+    const now = performance.now();
+    // Detect rapid double-tap in the same spot -> zoom 1x <-> 2x and restore HUD
+    if (
+      now - prevTapTime < 280 &&
+      Math.hypot(clientX - prevTapX, clientY - prevTapY) < 42
+    ) {
+      prevTapTime = 0;
+      setHudVisible(hudBeforeFirstTap);
+      setZoom(zoom > 1.1 ? 1 : 2);
+      return;
+    }
+
+    prevTapTime = now;
+    prevTapX = clientX;
+    prevTapY = clientY;
+    hudBeforeFirstTap = hudVisible;
+
+    // In Page Flip mode when HUD is closed and unzoomed, edge taps flip pages cleanly
+    if (mode === 'horizontal' && zoom <= 1 && !hudVisible) {
+      const ratio = clientX / Math.max(1, viewport.clientWidth);
+      if (ratio < 0.24) {
+        goToPage(currentPage - 1);
+        return;
+      }
+      if (ratio > 0.76) {
+        goToPage(currentPage + 1);
+        return;
+      }
+    }
+
+    // Instant 0ms toggle on the very first tap!
+    setHudVisible(!hudVisible);
+  }
+
   function onTouchStart(e) {
-    if (e.touches.length === 2) {
+    if (e.touches.length >= 2) {
+      wasMultiTouch = true;
       pinchStartDist = touchDist(e.touches[0], e.touches[1]);
       pinchStartZoom = zoom;
       touchMoved = true;
@@ -592,14 +642,16 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       return;
     }
     if (e.touches.length === 1) {
+      wasMultiTouch = false;
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
+      touchStartTime = performance.now();
       touchStartPanX = panX;
       touchStartPanY = panY;
       touchMoved = false;
       horizDragging = false;
       horizDragX = 0;
-      touchSamples = [{ x: touchStartX, t: performance.now() }];
+      touchSamples = [{ x: touchStartX, t: touchStartTime }];
     }
   }
 
@@ -610,10 +662,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       setZoom(pinchStartZoom * ratio);
       return;
     }
-    if (e.touches.length === 1) {
+    if (e.touches.length === 1 && !wasMultiTouch) {
       const dx = e.touches[0].clientX - touchStartX;
       const dy = e.touches[0].clientY - touchStartY;
-      if (Math.hypot(dx, dy) > 10) touchMoved = true;
+      if (Math.hypot(dx, dy) > 12) touchMoved = true;
 
       if (zoom > 1) {
         e.preventDefault();
@@ -625,7 +677,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         return;
       }
 
-      if (mode === 'horizontal' && (horizDragging || (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.15))) {
+      if (
+        mode === 'horizontal' &&
+        (horizDragging || (Math.abs(dx) > 12 && Math.abs(dx) > Math.abs(dy) * 1.15))
+      ) {
         e.preventDefault();
         horizDragging = true;
         const atStartEdge = currentPage <= 1 && dx > 0;
@@ -640,6 +695,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   }
 
   function onTouchEnd(e) {
+    lastTouchEndTime = performance.now();
     if (e.touches.length < 2) pinchStartDist = 0;
     if (e.changedTouches.length !== 1 || e.touches.length > 0) return;
 
@@ -671,35 +727,29 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       return;
     }
 
-    if (touchMoved) return;
+    if (wasMultiTouch || touchMoved) return;
+    // Ignore long presses (> 450ms)
+    if (performance.now() - touchStartTime > 450) return;
 
-    const now = Date.now();
-    const tapX = e.changedTouches[0].clientX;
-    if (now - lastTapTime < 280) {
-      clearTimeout(tapTimer);
-      lastTapTime = 0;
-      setZoom(zoom > 1.1 ? 1 : 2);
-      return;
-    }
-    lastTapTime = now;
-    tapTimer = setTimeout(() => handleViewportTap(tapX), 240);
+    const t = e.changedTouches[0];
+    handleSingleTapInstant(t.clientX, t.clientY);
   }
 
-  function handleViewportTap(clientX) {
-    if (mode === 'horizontal' && zoom <= 1) {
-      const ratio = clientX / Math.max(1, viewport.clientWidth);
-      if (ratio < 0.25) {
-        if (hudVisible) setHudVisible(false);
-        goToPage(currentPage - 1);
-        return;
-      }
-      if (ratio > 0.75) {
-        if (hudVisible) setHudVisible(false);
-        goToPage(currentPage + 1);
-        return;
-      }
+  function onTouchCancel() {
+    pinchStartDist = 0;
+    wasMultiTouch = false;
+    touchMoved = true;
+    if (horizDragging) {
+      horizDragging = false;
+      applyTransform();
     }
-    setHudVisible(!hudVisible);
+  }
+
+  // Mouse click only (strictly ignores synthetic click emitted after touchend!)
+  function onViewportClick(e) {
+    if (performance.now() - lastTouchEndTime < 700) return;
+    if (e.target.closest('button, input')) return;
+    handleSingleTapInstant(e.clientX, e.clientY);
   }
 
   let lastHudScrollTop = 0;
@@ -708,23 +758,14 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       lastHudScrollTop = viewport.scrollTop;
       return;
     }
-    if (Math.abs(viewport.scrollTop - lastHudScrollTop) > 28) {
-      setHudVisible(false);
-    }
-  }
-
-  let clickDelayTimer = 0;
-  function onViewportClick(e) {
-    if (e.pointerType === 'touch') return;
-    if (e.target.closest('button, input')) return;
-    if (e.detail >= 2) {
-      clearTimeout(clickDelayTimer);
-      setZoom(zoom > 1.1 ? 1 : 2);
+    // 450ms grace period after opening HUD so residual momentum scroll never closes it immediately
+    if (performance.now() - hudOpenedAt < 450) {
+      lastHudScrollTop = viewport.scrollTop;
       return;
     }
-    clearTimeout(clickDelayTimer);
-    const x = e.clientX;
-    clickDelayTimer = setTimeout(() => handleViewportTap(x), 180);
+    if (Math.abs(viewport.scrollTop - lastHudScrollTop) > 48) {
+      setHudVisible(false);
+    }
   }
 
   function onWheel(e) {
@@ -763,19 +804,19 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   viewport.addEventListener('touchstart', onTouchStart, { passive: true });
   viewport.addEventListener('touchmove', onTouchMove, { passive: false });
   viewport.addEventListener('touchend', onTouchEnd, { passive: true });
+  viewport.addEventListener('touchcancel', onTouchCancel, { passive: true });
   viewport.addEventListener('click', onViewportClick);
   viewport.addEventListener('wheel', onWheel, { passive: false });
   window.addEventListener('keydown', onKeyDown);
 
   cleanups.push(() => {
     stopAutoScrollLoops();
-    clearTimeout(tapTimer);
-    clearTimeout(clickDelayTimer);
     observer?.disconnect();
     viewport.removeEventListener('scroll', onViewportScroll);
     viewport.removeEventListener('touchstart', onTouchStart);
     viewport.removeEventListener('touchmove', onTouchMove);
     viewport.removeEventListener('touchend', onTouchEnd);
+    viewport.removeEventListener('touchcancel', onTouchCancel);
     viewport.removeEventListener('click', onViewportClick);
     viewport.removeEventListener('wheel', onWheel);
     window.removeEventListener('keydown', onKeyDown);

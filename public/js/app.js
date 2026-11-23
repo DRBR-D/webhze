@@ -179,7 +179,7 @@ export function navigate(url, { replace = false } = {}) {
 
 // --- Shared Kinetic Manga Card & States ---
 
-function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = null } = {}) {
+function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = null, index = 0 } = {}) {
   const id = book.id;
   const title = getBookTitle(book);
   const coverUrl = getBookCoverUrl(book);
@@ -191,10 +191,14 @@ function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = nu
       : 0;
 
   const badgeText = progressBadge || (pct > 0 ? `${pct.toFixed(0)}%` : null);
+  const staggerMs = Math.min(index, 9) * 32;
 
   return el(
     'article',
-    { className: 'manga-card' },
+    {
+      className: 'manga-card card-fly-in',
+      style: { '--stagger': `${staggerMs}ms` },
+    },
     el(
       'a',
       {
@@ -717,10 +721,11 @@ async function mountHomeView(container) {
       }
       gridEl.replaceChildren();
       const frag = document.createDocumentFragment();
+      let cardIdx = 0;
       for (const item of list) {
         if (loadedIds.has(item.id)) continue;
         loadedIds.add(item.id);
-        frag.appendChild(buildMangaCard(item));
+        frag.appendChild(buildMangaCard(item, { index: cardIdx++ }));
       }
       gridEl.appendChild(frag);
       renderLoadMoreControl();
@@ -926,9 +931,10 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
       }
       gridEl = el('div', { className: 'manga-grid' });
       const frag = document.createDocumentFragment();
+      let cardIdx = 0;
       for (const item of items) {
         loadedIds.add(item.id);
-        frag.appendChild(buildMangaCard(item));
+        frag.appendChild(buildMangaCard(item, { index: cardIdx++ }));
       }
       gridEl.appendChild(frag);
       contentHost.replaceChildren(
@@ -1062,7 +1068,7 @@ async function mountCollectionView(container, kind) {
     const grid = el(
       'div',
       { className: 'manga-grid' },
-      ...records.map((rec) => {
+      ...records.map((rec, idx) => {
         const book = rec.bookJson || { id: rec.id, num_pages: rec.totalPages };
         const progressBadge =
           kind === 'history' ? `${rec.lastReadPage}/${rec.totalPages || book.num_pages || '?'}` : null;
@@ -1070,6 +1076,7 @@ async function mountCollectionView(container, kind) {
         return buildMangaCard(book, {
           meta: rec,
           progressBadge,
+          index: idx,
           onDelete: async () => {
             if (kind === 'history') await clearHistoryItem(rec.id);
             else if (kind === 'favorites') await toggleFavorite(book);
