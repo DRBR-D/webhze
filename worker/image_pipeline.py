@@ -543,8 +543,9 @@ class MangaTranslationPipeline:
 
         return buf.getvalue(), {
             "bubbles": len(clusters),
-            "model": trans_meta.get("model", "gemini"),
+            "model": trans_meta.get("model", "deepseek-flash"),
             "fallbackCount": trans_meta.get("fallbackCount", 0),
+            "tokens": trans_meta.get("tokens", 0),
             "device": self.inpainter.device,
             "ms": int((time.perf_counter() - t0) * 1000),
         }

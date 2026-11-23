@@ -1570,6 +1570,10 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
   let keepTranslatingOnLeave = false;
   let workerStatus = { online: false, worker: null };
   let translatedStats = { done: 0, total: book.pages?.length || 0 };
+  const tokenStorageKey = `manga_trans_tokens_${numId}`;
+  let savedTotalTokens = 0;
+  try { savedTotalTokens = Number(localStorage.getItem(tokenStorageKey)) || 0; } catch {}
+  const fmtTokens = (n) => Number(n || 0).toLocaleString('vi-VN');
   cleanups.push(() => {
     if (!keepTranslatingOnLeave) translateAbort?.abort();
   });
@@ -1611,6 +1615,7 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
   );
 
   const translateActionsRow = el('div', { className: 'translate-actions-row' });
+  const translateTokenLine = el('p', { className: 'translate-token-summary tabular-nums', hidden: true });
 
   const translateCard = el(
     'section',
@@ -1622,6 +1627,7 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
       langSelect
     ),
     translateProgressWrap,
+    translateTokenLine,
     translateActionsRow
   );
 
@@ -1638,6 +1644,7 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
     }
 
     if (translating) {
+      translateTokenLine.hidden = true;
       translateProgressWrap.hidden = false;
       const busyBtns = [];
       if (translatedStats.done >= 3 && translatedStats.done < translatedStats.total) {
@@ -1676,6 +1683,10 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
     }
 
     translateProgressWrap.hidden = true;
+    translateTokenLine.hidden = !(savedTotalTokens > 0 && translatedStats.done > 0);
+    if (!translateTokenLine.hidden) {
+      translateTokenLine.textContent = `Tổng token đã ăn: ${fmtTokens(savedTotalTokens)} token`;
+    }
     const buttons = [];
 
     if (isFullyDone) {
@@ -1779,45 +1790,63 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
     keepTranslatingOnLeave = false;
     translateAbort = new AbortController();
     const total = book.pages.length;
+    let runTokens = force ? 0 : savedTotalTokens;
+    let sessionTokens = 0;
     translateBarFill.style.width = '4%';
-    translateProgressText.textContent = `Đang gửi trang 1–2 / ${total} xuống Laptop GPU...`;
+    translateProgressText.textContent = `Đang gửi trang 1–4 / ${total} xuống Laptop GPU...`;
     renderTranslateActions();
 
     try {
-      if (force) await clearBookTranslation(book, 'vi');
-      await translateBookPages(book, {
+      if (force) {
+        await clearBookTranslation(book, 'vi');
+        savedTotalTokens = 0;
+        try { localStorage.removeItem(tokenStorageKey); } catch {}
+      }
+      const res = await translateBookPages(book, {
         sourceLang: langSelect.value || 'auto',
         targetLang: 'vi',
         force,
         signal: translateAbort.signal,
         onProgress: (done, tot, metaInfo) => {
           translatedStats = { done, total: tot };
+          sessionTokens = Number(metaInfo?.totalTokens) || sessionTokens;
           const pct = Math.round((done / Math.max(1, tot)) * 100);
           translateBarFill.style.width = `${pct}%`;
           const modelNote = metaInfo?.model ? ` · ${metaInfo.model}` : '';
-          translateProgressText.textContent = `Đã dịch ${done} / ${tot} trang (${pct}%)${modelNote}`;
+          const tokNote = sessionTokens > 0 ? ` · ${fmtTokens(sessionTokens)} tok` : '';
+          translateProgressText.textContent = `Đã dịch ${done} / ${tot} trang (${pct}%)${modelNote}${tokNote}`;
           if (done >= 3 && done < tot && !keepTranslatingOnLeave) renderTranslateActions();
         },
       });
       translating = false;
       translateAbort = null;
+      savedTotalTokens = runTokens + (res.totalTokens || 0);
+      if (savedTotalTokens > 0) {
+        try { localStorage.setItem(tokenStorageKey, String(savedTotalTokens)); } catch {}
+      }
       translatedStats = await countTranslatedPages(book, 'vi');
+      const tokMsg = savedTotalTokens > 0 ? ` · Tổng ${fmtTokens(savedTotalTokens)} token` : '';
       if (keepTranslatingOnLeave) {
-        showToast(`Đã dịch xong toàn bộ ${translatedStats.done}/${translatedStats.total} trang!`, 'success');
+        showToast(`Đã dịch xong toàn bộ ${translatedStats.done}/${translatedStats.total} trang${tokMsg}!`, 'success');
         return;
       }
       renderTranslateActions();
-      showToast(`Dịch xong ${translatedStats.done}/${translatedStats.total} trang! Đang mở bản Tiếng Việt...`, 'success');
+      showToast(`Dịch xong ${translatedStats.done}/${translatedStats.total} trang${tokMsg}! Đang mở bản Tiếng Việt...`, 'success');
       // Auto-open Reader in Vietnamese once translation finishes!
       const startPage = Math.max(1, lastReadPage || 1);
       openBookReader(book, startPage, startPage === 1 ? coverBox : null, { langMode: 'vi' });
     } catch (err) {
       translating = false;
       translateAbort = null;
+      if (sessionTokens > 0) {
+        savedTotalTokens = runTokens + sessionTokens;
+        try { localStorage.setItem(tokenStorageKey, String(savedTotalTokens)); } catch {}
+      }
       translatedStats = await countTranslatedPages(book, 'vi');
       renderTranslateActions();
       if (err.name === 'AbortError') {
-        showToast(`Đã hủy dịch (đã lưu ${translatedStats.done}/${total} trang).`);
+        const tokNote = sessionTokens > 0 ? ` · đã ăn ${fmtTokens(sessionTokens)} token` : '';
+        showToast(`Đã hủy dịch (đã lưu ${translatedStats.done}/${total} trang${tokNote}).`);
       } else {
         showToast(err.message || 'Lỗi dịch truyện.', 'error');
       }

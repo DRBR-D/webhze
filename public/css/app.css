@@ -1878,6 +1878,12 @@ html.is-standalone .app-stage {
   font-weight: 700;
   color: var(--text-primary);
 }
+.translate-token-summary {
+  margin: 0;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
 
 .translate-actions-row {
   display: flex;

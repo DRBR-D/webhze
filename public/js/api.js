@@ -339,9 +339,10 @@ export async function translateBookPages(
   const cache = 'caches' in window ? await caches.open(TRANSLATED_CACHE_NAME) : null;
   let done = 0;
   let cursor = 0;
+  let totalTokens = 0;
   const total = pages.length;
 
-  // Pipelined 2-slot worker queue: overlaps page N+1 download/OCR/Gemini while GPU finishes page N
+  // Pipelined 4-slot worker queue: overlaps page N+1..N+3 download/OCR/API while GPU finishes page N
   async function slotWorker() {
     while (cursor < total) {
       if (signal?.aborted) throw new DOMException('Đã hủy dịch truyện', 'AbortError');
@@ -350,7 +351,7 @@ export async function translateBookPages(
         const hit = await cache.match(translatedCacheKey(book.id, p.number, targetLang));
         if (hit) {
           done++;
-          onProgress?.(done, total, { cached: true, page: p.number });
+          onProgress?.(done, total, { cached: true, page: p.number, tokens: 0, totalTokens });
           continue;
         }
       }
@@ -362,12 +363,14 @@ export async function translateBookPages(
         signal,
       });
       URL.revokeObjectURL(res.objectUrl);
+      const pageTokens = Number(res.meta?.tokens) || 0;
+      totalTokens += pageTokens;
       done++;
-      onProgress?.(done, total, { ...res.meta, page: p.number });
+      onProgress?.(done, total, { ...res.meta, page: p.number, tokens: pageTokens, totalTokens });
     }
   }
 
   const slots = Math.min(Math.max(1, concurrency), total);
   await Promise.all(Array.from({ length: slots }, () => slotWorker()));
-  return { done, total };
+  return { done, total, totalTokens };
 }

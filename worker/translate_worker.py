@@ -11,6 +11,7 @@ import os
 import pathlib
 import socket
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +28,9 @@ except Exception:
 
 WORKER_DIR = pathlib.Path(__file__).resolve().parent
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+_BOOK_TOKENS_LOCK = threading.Lock()
+_BOOK_TOKENS: dict[str, int] = {}
+_SESSION_TOTAL_TOKENS = 0
 
 
 def load_dotenv(env_path: pathlib.Path) -> None:
@@ -205,9 +209,17 @@ def handle_job(
             reading_dir=reading_dir,
         )
         post_result(session, server_url, token, job_id, webp_bytes=webp_bytes, meta=meta)
+        page_tok = int(meta.get("tokens") or 0)
+        global _SESSION_TOTAL_TOKENS
+        with _BOOK_TOKENS_LOCK:
+            bkey = str(book_id)
+            _BOOK_TOKENS[bkey] = _BOOK_TOKENS.get(bkey, 0) + page_tok
+            book_tok = _BOOK_TOKENS[bkey]
+            _SESSION_TOTAL_TOKENS += page_tok
+            sess_tok = _SESSION_TOTAL_TOKENS
         print(
             f"[Done {job_id}] {meta.get('bubbles', 0)} bóng thoại | {meta.get('model')} | "
-            f"{meta.get('ms', 0)}ms | {len(webp_bytes) // 1024}KB",
+            f"{page_tok} tok (Σ truyện: {book_tok:,} | Σ phiên: {sess_tok:,}) | {meta.get('ms', 0)}ms | {len(webp_bytes) // 1024}KB",
             flush=True,
         )
     except Exception as exc:

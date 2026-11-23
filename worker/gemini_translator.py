@@ -17,13 +17,13 @@ try:
 except Exception:
     GoogleTranslator = None
 
-LANG_NAMES = {
-    "auto": "the original language (Japanese, English, Chinese, Korean, etc.)",
-    "ja": "Japanese",
-    "en": "English",
-    "zh": "Chinese",
-    "ko": "Korean",
-}
+# Pure punctuation/symbols/page-numbers need 0 AI tokens
+_NO_TRANSLATE_RE = re.compile(r"^[\d\s\W_…・。、！？!?,.:;~～\-—―♡♥★☆♪♫()\[\]「」『』]+$")
+
+_SYSTEM_PROMPT = (
+    "Translate manga JSON values to natural, concise Vietnamese (keep pronouns & tone consistent across lines). "
+    "Return valid JSON object with the exact same keys only."
+)
 
 
 def _extract_translations(raw_text: str, expected_len: int) -> list[str] | None:
@@ -86,37 +86,28 @@ class GeminiMangaTranslator:
         self._api_sem = threading.Semaphore(2)
         self._cooldown_until = 0.0
 
-    def _build_prompt(self, lines: Sequence[str], source_lang: str, target_lang: str) -> str:
-        lang_desc = LANG_NAMES.get(source_lang, source_lang)
-        target_name = "Vietnamese" if target_lang == "vi" else target_lang
-        numbered = {str(i + 1): ln for i, ln in enumerate(lines)}
-        return (
-            f"Translate manga dialogue from {lang_desc} into natural, idiomatic {target_name}.\n"
-            "Rules:\n"
-            "- Keep pronouns (anh/em, cậu/tớ, tôi/cô, tao/mày...) and tone consistent across all lines.\n"
-            "- Keep each line concise for comic speech bubbles.\n"
-            f"- Return ONLY a JSON object with the exact same numeric keys \"1\"..\"{len(lines)}\".\n\n"
-            f"Input:\n{json.dumps(numbered, ensure_ascii=False)}"
-        )
-
-    def _call_deepseek(self, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str]:
+    def _call_deepseek(self, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str, int]:
         if not self.api_key:
-            return None, "no_api_key"
+            return None, "no_api_key", 0
         if self._cooldown_until > time.time():
-            return None, "cooldown"
+            return None, "cooldown", 0
 
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        numbered = {str(i + 1): ln for i, ln in enumerate(lines)}
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": self._build_prompt(lines, source_lang, target_lang)}],
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(numbered, ensure_ascii=False, separators=(",", ":"))},
+            ],
             "temperature": 0.25,
-            "max_tokens": max(1024, len(lines) * 160),
+            "max_tokens": max(512, len(lines) * 120),
             "response_format": {"type": "json_object"},
-            # Disable reasoning tokens on deepseek-flash -> ~0.65s latency, cheaper, zero JSON truncation
+            # Disable reasoning tokens on deepseek-flash -> ~3.5x fewer tokens, ~0.65s latency
             "thinking": {"type": "disabled"},
         }
 
@@ -125,27 +116,28 @@ class GeminiMangaTranslator:
                 resp = self.session.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
         except requests.RequestException as exc:
             self._cooldown_until = time.time() + 60
-            return None, f"net_err:{exc.__class__.__name__}"
+            return None, f"net_err:{exc.__class__.__name__}", 0
 
         if resp.status_code in (402, 429, 503):
             self._cooldown_until = time.time() + 120
-            return None, f"http_{resp.status_code}"
+            return None, f"http_{resp.status_code}", 0
         if resp.status_code >= 400:
-            return None, f"http_{resp.status_code}"
+            return None, f"http_{resp.status_code}", 0
 
         data = resp.json()
+        tokens = int((data.get("usage") or {}).get("total_tokens") or 0)
         choices = data.get("choices") or []
         if not choices:
-            return None, "no_choices"
+            return None, "no_choices", tokens
         choice = choices[0]
         if choice.get("finish_reason") == "content_filter":
-            return None, "blocked:content_filter"
+            return None, "blocked:content_filter", tokens
 
         raw_text = choice.get("message", {}).get("content") or ""
         parsed = _extract_translations(raw_text, len(lines))
         if not parsed:
-            return None, "parse_mismatch"
-        return parsed, "ok"
+            return None, "parse_mismatch", tokens
+        return parsed, "ok", tokens
 
     def _fallback_line(self, text: str, source_lang: str, target_lang: str) -> str:
         clean = (text or "").strip()
@@ -165,35 +157,47 @@ class GeminiMangaTranslator:
         target_lang: str = "vi",
     ) -> tuple[list[str], dict]:
         if not lines:
-            return [], {"model": "none", "fallbackCount": 0}
+            return [], {"model": "none", "fallbackCount": 0, "tokens": 0}
+
+        # Skip pure punctuation/numbers/symbols so they consume 0 tokens
+        output = list(lines)
+        active_indices = [i for i, ln in enumerate(lines) if ln.strip() and not _NO_TRANSLATE_RE.match(ln.strip())]
+        if not active_indices:
+            return output, {"model": "skip_symbols", "fallbackCount": 0, "tokens": 0}
+
+        active_lines = [lines[i] for i in active_indices]
 
         # Tier 1: Whole-page contextual pass via deepseek-flash
-        translated, status = self._call_deepseek(lines, source_lang, target_lang)
+        translated, status, total_tokens = self._call_deepseek(active_lines, source_lang, target_lang)
         if translated is not None:
-            return translated, {"model": self.model, "fallbackCount": 0}
+            for idx, tr in zip(active_indices, translated):
+                output[idx] = tr
+            return output, {"model": self.model, "fallbackCount": 0, "tokens": total_tokens}
 
         if status != "cooldown":
             print(f"[DeepSeek] {self.model} -> {status}", flush=True)
 
         # Tier 2: Retry per-line if whole page hit content_filter, fallback only blocked lines
         was_blocked = status.startswith("blocked:")
-        results: list[str] = []
         fallback_count = 0
         used_ds = False
 
-        for line in lines:
+        for idx in active_indices:
+            line = lines[idx]
             translated_line = None
             if was_blocked:
-                res, _ = self._call_deepseek([line], source_lang, target_lang)
+                res, _, tok = self._call_deepseek([line], source_lang, target_lang)
+                total_tokens += tok
                 if res:
                     translated_line = res[0]
                     used_ds = True
             if not translated_line:
                 translated_line = self._fallback_line(line, source_lang, target_lang)
                 fallback_count += 1
-            results.append(translated_line)
+            output[idx] = translated_line
 
-        return results, {
+        return output, {
             "model": f"{self.model}+fallback" if used_ds and fallback_count else "fallback",
             "fallbackCount": fallback_count,
+            "tokens": total_tokens,
         }
