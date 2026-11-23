@@ -151,6 +151,127 @@ export function rubberband(overshoot, dimension = 180, constant = 0.55) {
   return (overshoot * dimension * constant) / (dimension + constant * Math.abs(overshoot));
 }
 
+/**
+ * Sequential sliding-window preload order around `currentPage`:
+ * e.g. page 1 -> [2, 3, 4, 5]; page 4 -> [5, 6, 7, 8, 3, 2, 1].
+ */
+export function computePreloadOrder(currentPage, totalPages, ahead = 4, behind = 3) {
+  const cur = Math.max(1, Math.min(totalPages, Number(currentPage) || 1));
+  const order = [];
+  for (let i = 1; i <= ahead; i++) {
+    if (cur + i <= totalPages) order.push(cur + i);
+  }
+  for (let i = 1; i <= behind; i++) {
+    if (cur - i >= 1) order.push(cur - i);
+  }
+  return order;
+}
+
+/**
+ * GPU-composited FLIP shared-element fly transition for cover -> Detail / Detail -> Reader Page 1.
+ * Always cleans up and reveals `toEl` even under reduced motion or interrupted navigation.
+ */
+export function runHeroFlyTransition({
+  imgSrc,
+  fromRect,
+  toEl,
+  fromRadius = '14px',
+  toRadius = '16px',
+  duration = 360,
+  objectFit = 'cover',
+  onFinish = null,
+} = {}) {
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  if (reduced || !imgSrc || !fromRect || !toEl || fromRect.width < 8 || fromRect.height < 8) {
+    onFinish?.();
+    return () => {};
+  }
+
+  let finished = false;
+  let clone = null;
+  let anim = null;
+  let timer = 0;
+
+  const done = () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    if (toEl) toEl.style.visibility = '';
+    if (anim) {
+      try { anim.cancel(); } catch {}
+    }
+    clone?.remove();
+    onFinish?.();
+  };
+
+  toEl.style.visibility = 'hidden';
+
+  requestAnimationFrame(() => {
+    if (finished || !toEl.isConnected) {
+      done();
+      return;
+    }
+    const toRect = toEl.getBoundingClientRect();
+    if (toRect.width < 8 || toRect.height < 8) {
+      done();
+      return;
+    }
+
+    const dx = fromRect.left - toRect.left;
+    const dy = fromRect.top - toRect.top;
+    const sx = fromRect.width / toRect.width;
+    const sy = fromRect.height / toRect.height;
+
+    clone = document.createElement('img');
+    clone.src = imgSrc;
+    clone.alt = '';
+    clone.referrerPolicy = 'no-referrer';
+    clone.className = 'hero-fly-clone';
+    Object.assign(clone.style, {
+      position: 'fixed',
+      left: `${toRect.left}px`,
+      top: `${toRect.top}px`,
+      width: `${toRect.width}px`,
+      height: `${toRect.height}px`,
+      objectFit,
+      transformOrigin: 'top left',
+      borderRadius: toRadius,
+      zIndex: '120',
+      pointerEvents: 'none',
+      willChange: 'transform, border-radius',
+      boxShadow: '0 14px 36px rgba(0, 0, 0, 0.28)',
+    });
+    document.body.appendChild(clone);
+
+    if (typeof clone.animate === 'function') {
+      anim = clone.animate(
+        [
+          {
+            transform: `translate3d(${dx}px, ${dy}px, 0) scale(${sx}, ${sy})`,
+            borderRadius: fromRadius,
+          },
+          {
+            transform: 'translate3d(0, 0, 0) scale(1, 1)',
+            borderRadius: toRadius,
+          },
+        ],
+        {
+          duration,
+          easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+          fill: 'forwards',
+        }
+      );
+      anim.addEventListener('finish', done, { once: true });
+      anim.addEventListener('cancel', done, { once: true });
+      timer = setTimeout(done, duration + 90);
+    } else {
+      done();
+    }
+  });
+
+  return done;
+}
+
 let supportsDisplayTransition;
 function canTransitionDisplay() {
   if (supportsDisplayTransition !== undefined) return supportsDisplayTransition;

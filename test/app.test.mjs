@@ -16,7 +16,7 @@ import {
   applyRedeemCode,
   applySpendPoints,
 } from '../public/js/store.js';
-import { parseRoute } from '../public/js/dom.js';
+import { parseRoute, computePreloadOrder } from '../public/js/dom.js';
 import { createAppServer, validateApiPath, validateImageUrl } from '../server.mjs';
 
 test('URL builders match ASCII-sum server picking spec', () => {
@@ -97,6 +97,13 @@ test('SPA route parser handles all spec routes', () => {
   assert.deepEqual(parseRoute('/downloads'), { name: 'downloads', params: {} });
   assert.deepEqual(parseRoute('/manga/177013'), { name: 'detail', params: { id: 177013 } });
   assert.deepEqual(parseRoute('/read/177013/15'), { name: 'reader', params: { id: 177013, page: 15 } });
+});
+
+test('Sliding-window preload order loads 4 ahead then 3 behind sequentially', () => {
+  assert.deepEqual(computePreloadOrder(1, 20), [2, 3, 4, 5]);
+  assert.deepEqual(computePreloadOrder(4, 20), [5, 6, 7, 8, 3, 2, 1]);
+  assert.deepEqual(computePreloadOrder(19, 20), [20, 18, 17, 16]);
+  assert.deepEqual(computePreloadOrder(1, 3), [2, 3]);
 });
 
 test('Proxy endpoint and image URL validators block SSRF and traversal', () => {

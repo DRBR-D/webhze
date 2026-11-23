@@ -328,10 +328,12 @@ dialog.app-dialog.glass-regular {
 
 *, *::before, *::after { box-sizing: border-box; }
 
+[hidden] { display: none !important; }
+
 html {
   -webkit-tap-highlight-color: transparent;
   -webkit-text-size-adjust: 100%;
-  overscroll-behavior-y: none;
+  overscroll-behavior-y: contain;
   scroll-padding-top: calc(var(--toolbar-height) + env(safe-area-inset-top, 0px) + 0.75rem);
   scroll-padding-bottom: calc(var(--tabbar-clearance) + env(safe-area-inset-bottom, 0px));
   background: var(--bg);
@@ -701,34 +703,43 @@ html.is-standalone .app-stage {
   padding-top: env(safe-area-inset-top, 0px);
   padding-left: env(safe-area-inset-left, 0px);
   padding-right: env(safe-area-inset-right, 0px);
-  background: var(--bg);
-  border-bottom: 1px solid var(--separator);
-  transition: background-color 200ms var(--ease-out), border-color 200ms var(--ease-out);
+  background: transparent;
+  border-bottom: 0;
 }
 
-.app-shell.is-home-route .top-header:not(.is-scrolled) {
+/* Smooth progressive frosted backdrop driven by --header-p (0 -> 1), ZERO layout shift */
+.top-header::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--separator);
+  opacity: var(--header-p, 1);
+  pointer-events: none;
+  will-change: opacity;
+}
+
+/* On Home, header ALWAYS stays position: fixed so scrolling never jumps content by 54px! */
+.app-shell.is-home-route .top-header {
   position: fixed;
+  top: 0;
   left: 0;
   right: 0;
-  background: transparent;
-  border-bottom-color: transparent;
 }
 
 @media (min-width: 900px) {
-  .app-shell.is-home-route:not(.sidebar-collapsed) .top-header:not(.is-scrolled) {
+  .app-shell.is-home-route:not(.sidebar-collapsed) .top-header {
     left: var(--drawer-width);
   }
 }
 
-.app-shell.is-home-route .top-header:not(.is-scrolled) .toolbar-brand-title {
-  opacity: 0;
-}
-
-.top-header.is-scrolled {
-  background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(10px);
-  backdrop-filter: blur(10px);
-  border-bottom-color: var(--separator);
+.app-shell.is-home-route .toolbar-brand-title {
+  opacity: var(--header-p, 0);
+  transform: translate3d(0, calc((1 - var(--header-p, 0)) * 6px), 0);
+  will-change: opacity, transform;
 }
 
 .top-header-inner {
@@ -750,7 +761,7 @@ html.is-standalone .app-stage {
   place-items: center;
   color: #FFFFFF;
   cursor: pointer;
-  transition: transform 110ms var(--ease-out);
+  transition: transform 110ms var(--ease-out), color 220ms var(--ease-out), background-color 220ms var(--ease-out), border-color 220ms var(--ease-out), box-shadow 220ms var(--ease-out);
 }
 .header-circle-btn:active { transform: scale(0.93); }
 
@@ -772,7 +783,6 @@ html.is-standalone .app-stage {
   font-weight: 700;
   font-size: 0.98rem;
   letter-spacing: 0.14em;
-  transition: opacity 180ms var(--ease-out);
 }
 
 .header-right-group {
@@ -1571,11 +1581,36 @@ html.is-standalone .app-stage {
    ========================================================================== */
 
 .detail-banner-wash {
+  position: relative;
+  overflow: hidden;
   background: var(--detail-wash);
-  padding: max(0.8rem, env(safe-area-inset-top, 0px)) max(0.95rem, env(safe-area-inset-right, 0px)) 3.4rem max(0.95rem, env(safe-area-inset-left, 0px));
+  padding: max(0.8rem, env(safe-area-inset-top, 0px)) max(0.95rem, env(safe-area-inset-right, 0px)) 3.8rem max(0.95rem, env(safe-area-inset-left, 0px));
+}
+
+.detail-banner-bg {
+  position: absolute;
+  inset: -18px;
+  inline-size: calc(100% + 36px);
+  block-size: calc(100% + 36px);
+  object-fit: cover;
+  filter: blur(22px) saturate(1.22) brightness(0.76);
+  transform: scale(1.06);
+  z-index: 0;
+  pointer-events: none;
+  animation: detailBackdropFade 480ms var(--ease-out) both;
+}
+
+.detail-banner-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: linear-gradient(180deg, rgba(10, 10, 18, 0.24) 0%, rgba(10, 10, 18, 0.56) 100%);
+  pointer-events: none;
 }
 
 .detail-top-bar {
+  position: relative;
+  z-index: 2;
   max-inline-size: 1080px;
   margin-inline: auto;
   display: flex;
@@ -1610,6 +1645,8 @@ html.is-standalone .app-stage {
 }
 
 .detail-body-container {
+  position: relative;
+  z-index: 3;
   max-inline-size: 1080px;
   margin-top: -2.6rem;
 }
@@ -1630,12 +1667,27 @@ html.is-standalone .app-stage {
 }
 
 .detail-cover-box {
+  position: relative;
+  z-index: 3;
   aspect-ratio: 5 / 7;
   border-radius: 16px;
   overflow: hidden;
   background: var(--surface-muted);
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
   animation: coverPopIn 300ms var(--ease-out) both;
+}
+.detail-cover-box.is-hero-flying {
+  animation: none;
+}
+
+.detail-fade-in {
+  animation: detailTextFade 380ms var(--ease-out) var(--fade-delay, 0ms) both;
+}
+
+.no-entry-anim .detail-banner-bg,
+.no-entry-anim .detail-cover-box,
+.no-entry-anim .detail-fade-in {
+  animation: none !important;
 }
 
 .detail-cover-img {
@@ -2003,6 +2055,13 @@ html.is-standalone .app-stage {
 }
 .eye-filter-dot.active { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(255, 90, 54, 0.45); }
 
+@media (max-width: 359px) {
+  .reader-kinetic-panel { padding: 0.72rem 0.75rem; }
+  .kinetic-mode-btn { padding: 0.28rem 0.56rem; font-size: 0.72rem; }
+  .eye-filter-row { gap: 0.28rem; }
+  .eye-filter-dot { inline-size: 24px; block-size: 24px; min-inline-size: 24px; min-block-size: 24px; }
+}
+
 .kinetic-auto-card {
   padding: 0.58rem 0.7rem;
   border-radius: 15px;
@@ -2122,6 +2181,53 @@ html.is-standalone .app-stage {
     transform: translate3d(0, 0, 0) scale(1);
   }
 }
+
+@keyframes detailBackdropFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes detailTextFade {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/* Native Pull-to-Refresh Indicator */
+.ptr-indicator {
+  position: fixed;
+  top: env(safe-area-inset-top, 0px);
+  left: 50%;
+  z-index: 95;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.42rem 0.9rem;
+  border-radius: var(--radius-pill);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.16);
+  color: var(--text-primary);
+  font-size: 0.78rem;
+  font-weight: 700;
+  opacity: 0;
+  transform: translate3d(-50%, -52px, 0);
+  pointer-events: none;
+  transition: transform 280ms var(--ease-out), opacity 220ms var(--ease-out), color 160ms var(--ease-out);
+  will-change: transform, opacity;
+}
+.ptr-indicator.is-dragging { transition: none; }
+.ptr-indicator.is-ready { color: var(--primary); border-color: rgba(255, 90, 54, 0.35); }
+.ptr-indicator.is-refreshing { color: var(--primary); }
+.ptr-icon { display: inline-grid; place-items: center; }
+.ptr-indicator.is-refreshing .ptr-icon { animation: spin 0.75s linear infinite; }
 
 .reader-viewport {
   flex: 1;
@@ -2529,7 +2635,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
 @media (prefers-reduced-motion: reduce) {
   dialog.app-dialog { transition-duration: 120ms; transform: none !important; }
-  .nav-drawer, .app-stage, .reader-top-bar, .reader-kinetic-panel, .toast-region { transition-duration: 120ms !important; }
-  .card-fly-in, .page-fly-next, .page-fly-prev, .page-fly-in, .detail-cover-box { animation: none !important; }
+  .nav-drawer, .app-stage, .reader-top-bar, .reader-kinetic-panel, .toast-region, .ptr-indicator { transition-duration: 120ms !important; }
+  .card-fly-in, .page-fly-next, .page-fly-prev, .page-fly-in, .detail-cover-box, .detail-banner-bg, .detail-fade-in { animation: none !important; }
   .shimmer { animation: none; opacity: 0.75; }
 }

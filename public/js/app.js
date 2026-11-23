@@ -36,6 +36,8 @@ import {
   svgIcon,
   createMangaImg,
   revokeObjectUrls,
+  rubberband,
+  runHeroFlyTransition,
   wireIosSheet,
   closeTopLayer,
   formatNumber,
@@ -66,6 +68,84 @@ let activeCleanup = null;
 let favoriteIdSet = new Set();
 let historyMap = new Map();
 let cachedPopularList = [];
+
+// Navigation stack, scroll restoration, in-memory view caches, and hero fly-in state
+let navSeq = Math.max(1, Number(window.history.state?.navId) || 1);
+let currentNavId = navSeq;
+const scrollPositions = new Map();
+const bookMemoryCache = new Map();
+let homeCache = null;
+const searchCache = new Map();
+let pendingHeroTransition = null;
+let syncHeaderChromeFn = null;
+
+function cacheBook(book) {
+  if (!book?.id) return;
+  const id = Number(book.id);
+  const existing = bookMemoryCache.get(id);
+  // Prefer keeping full book objects (with pages & tags) over summary cards
+  if (existing?.pages?.length && !book.pages?.length) return;
+  bookMemoryCache.set(id, book);
+  if (bookMemoryCache.size > 32) {
+    const oldestKey = bookMemoryCache.keys().next().value;
+    bookMemoryCache.delete(oldestKey);
+  }
+}
+
+function getScrollTop() {
+  return Math.max(window.scrollY || 0, appStage?.scrollTop || 0);
+}
+
+function setScrollTop(y) {
+  const target = Math.max(0, Math.round(Number(y) || 0));
+  window.scrollTo({ top: target, behavior: 'instant' });
+  if (appStage) appStage.scrollTop = target;
+}
+
+function saveCurrentScroll() {
+  scrollPositions.set(currentNavId, getScrollTop());
+}
+
+function captureHeroTransition(type, book, sourceEl, extra = {}) {
+  if (!book?.id) return;
+  cacheBook(book);
+  const imgEl = sourceEl?.tagName === 'IMG' ? sourceEl : sourceEl?.querySelector('img');
+  const fromRect = imgEl ? imgEl.getBoundingClientRect() : null;
+  const imgSrc = imgEl?.currentSrc || imgEl?.src || getBookCoverUrl(book);
+  let borderRadius = '14px';
+  if (imgEl) {
+    const styleTarget = imgEl.closest('.manga-cover-wrap, .detail-cover-box, .weekly-card, .ranking-thumb') || imgEl;
+    borderRadius = getComputedStyle(styleTarget).borderRadius || '14px';
+  }
+  pendingHeroTransition = {
+    type,
+    id: Number(book.id),
+    book,
+    imgSrc,
+    fromRect:
+      fromRect && fromRect.width > 8 && fromRect.height > 8
+        ? { left: fromRect.left, top: fromRect.top, width: fromRect.width, height: fromRect.height }
+        : null,
+    borderRadius,
+    ts: performance.now(),
+    ...extra,
+  };
+}
+
+function openBookDetail(book, sourceEl = null) {
+  captureHeroTransition('to-detail', book, sourceEl);
+  navigate(`/manga/${book.id}`);
+}
+
+function openBookReader(book, page = 1, sourceEl = null) {
+  const targetPage = Math.max(1, Number(page) || 1);
+  if (sourceEl) {
+    captureHeroTransition('to-reader', book, sourceEl, { page: targetPage });
+  } else {
+    cacheBook(book);
+  }
+  navigate(`/read/${book.id}/${targetPage}`);
+}
 
 const appMain = document.getElementById('app-main');
 const appShell = document.getElementById('app-shell');
@@ -168,18 +248,46 @@ function updateActiveNav(routeName) {
 
 export function navigate(url, { replace = false } = {}) {
   closeMobileDrawer();
+  saveCurrentScroll();
   const next = new URL(url, window.location.origin);
   const full = `${next.pathname}${next.search}`;
-  if (full !== `${window.location.pathname}${window.location.search}`) {
-    if (replace) window.history.replaceState(null, '', full);
-    else window.history.pushState(null, '', full);
+  const currentFull = `${window.location.pathname}${window.location.search}`;
+  if (full !== currentFull) {
+    const curStackIdx = Number(window.history.state?.stackIdx) || 0;
+    const nextNavId = ++navSeq;
+    const nextState = replace
+      ? { navId: nextNavId, stackIdx: curStackIdx }
+      : { navId: nextNavId, stackIdx: curStackIdx + 1 };
+    if (replace) window.history.replaceState(nextState, '', full);
+    else window.history.pushState(nextState, '', full);
+    currentNavId = nextNavId;
   }
-  renderRoute();
+  renderRoute({ isPop: false });
+}
+
+export function goBack(fallbackUrl = '/') {
+  if (appSheet?.open) {
+    closeTopLayer(appSheet);
+    return;
+  }
+  if (appShell.classList.contains('drawer-open')) {
+    closeMobileDrawer();
+    return;
+  }
+  const route = parseRoute(window.location.pathname, window.location.search);
+  if (route.name === 'home') return;
+
+  const stackIdx = Number(window.history.state?.stackIdx) || 0;
+  if (stackIdx > 0) {
+    window.history.back();
+  } else {
+    navigate(fallbackUrl, { replace: true });
+  }
 }
 
 // --- Shared Kinetic Manga Card & States ---
 
-function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = null, index = 0 } = {}) {
+function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = null, index = 0, noAnim = false } = {}) {
   const id = book.id;
   const title = getBookTitle(book);
   const coverUrl = getBookCoverUrl(book);
@@ -192,22 +300,27 @@ function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = nu
 
   const badgeText = progressBadge || (pct > 0 ? `${pct.toFixed(0)}%` : null);
   const staggerMs = Math.min(index, 9) * 32;
+  const openDirectReader = Boolean(progressBadge && hist?.lastReadPage);
 
   return el(
     'article',
     {
-      className: 'manga-card card-fly-in',
-      style: { '--stagger': `${staggerMs}ms` },
+      className: `manga-card ${noAnim ? '' : 'card-fly-in'}`.trim(),
+      style: noAnim ? {} : { '--stagger': `${staggerMs}ms` },
     },
     el(
       'a',
       {
-        href: progressBadge && hist?.lastReadPage ? `/read/${id}/${hist.lastReadPage}` : `/manga/${id}`,
+        href: openDirectReader ? `/read/${id}/${hist.lastReadPage}` : `/manga/${id}`,
         className: 'manga-card-link',
         onClick: (e) => {
           if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
           e.preventDefault();
-          navigate(progressBadge && hist?.lastReadPage ? `/read/${id}/${hist.lastReadPage}` : `/manga/${id}`);
+          if (openDirectReader) {
+            openBookReader(book, hist.lastReadPage, e.currentTarget);
+          } else {
+            openBookDetail(book, e.currentTarget);
+          }
         },
       },
       el(
@@ -289,7 +402,9 @@ function openRankingSheet() {
           {
             type: 'button',
             className: 'ranking-row',
-            onClick: () => {
+            onClick: (e) => {
+              const rowEl = e.currentTarget;
+              captureHeroTransition('to-detail', book, rowEl);
               closeTopLayer(appSheet);
               navigate(`/manga/${book.id}`);
             },
@@ -467,7 +582,7 @@ function openCouponsSheet() {
 
 // --- Screen 1: Home (`/`) — Exact Kinetic Reader Layout ---
 
-async function mountHomeView(container) {
+async function mountHomeView(container, { restoreCache = false, forceRefresh = false } = {}) {
   const cleanups = [];
   const abortController = new AbortController();
   cleanups.push(() => abortController.abort());
@@ -476,6 +591,7 @@ async function mountHomeView(container) {
   let totalPages = 1;
   let loadingMore = false;
   const loadedIds = new Set();
+  const loadedItems = [];
 
   const heroHost = el('div', { className: 'kinetic-hero-host' });
   const weeklyTrack = el('div', { className: 'weekly-track' });
@@ -575,7 +691,7 @@ async function mountHomeView(container) {
             onClick: (e) => {
               if (e.metaKey || e.ctrlKey) return;
               e.preventDefault();
-              navigate(`/manga/${book.id}`);
+              openBookDetail(book, e.currentTarget);
             },
           },
           createMangaImg(cover, title, { priority, className: 'kinetic-hero-img', width: 500, height: 680 }),
@@ -626,7 +742,7 @@ async function mountHomeView(container) {
             onClick: (e) => {
               if (e.metaKey || e.ctrlKey) return;
               e.preventDefault();
-              navigate(`/manga/${book.id}`);
+              openBookDetail(book, e.currentTarget);
             },
           },
           createMangaImg(getBookCoverUrl(book), title, { priority: 'lazy', className: 'weekly-card-img', width: 220, height: 220 }),
@@ -649,6 +765,15 @@ async function mountHomeView(container) {
     }
   }
 
+  function syncHomeCache() {
+    homeCache = {
+      popularList: cachedPopularList,
+      items: loadedItems.slice(),
+      currentPage,
+      totalPages,
+    };
+  }
+
   async function loadMoreHome() {
     if (loadingMore || currentPage >= totalPages) return;
     loadingMore = true;
@@ -662,9 +787,12 @@ async function mountHomeView(container) {
       for (const item of data.result || []) {
         if (loadedIds.has(item.id)) continue;
         loadedIds.add(item.id);
+        loadedItems.push(item);
+        cacheBook(item);
         frag.appendChild(buildMangaCard(item));
       }
       gridEl.appendChild(frag);
+      syncHomeCache();
     } catch (err) {
       if (err.name !== 'AbortError') showToast(err.message || 'Không tải thêm được truyện.', 'error');
     } finally {
@@ -678,22 +806,51 @@ async function mountHomeView(container) {
       const data = await fetchGalleries(1, 25, abortController.signal);
       totalPages = data.num_pages || totalPages;
       const prependFrag = document.createDocumentFragment();
+      const newItems = [];
       for (const item of data.result || []) {
         if (!loadedIds.has(item.id)) {
           loadedIds.add(item.id);
+          newItems.push(item);
+          cacheBook(item);
           prependFrag.appendChild(buildMangaCard(item));
         }
       }
-      if (prependFrag.childNodes.length > 0) gridEl.prepend(prependFrag);
+      if (prependFrag.childNodes.length > 0) {
+        loadedItems.unshift(...newItems);
+        gridEl.prepend(prependFrag);
+        syncHomeCache();
+      }
     } catch {
       // Silent background refresh failure
     }
   }
 
   async function loadInitial() {
+    if (!forceRefresh && homeCache?.items?.length) {
+      cachedPopularList = homeCache.popularList || [];
+      totalPages = homeCache.totalPages || 1;
+      currentPage = homeCache.currentPage || 1;
+      renderHeroBanner(cachedPopularList);
+      renderWeeklyUpdate(cachedPopularList);
+      recommendCountBadge.textContent = `${homeCache.items.length}+`;
+      gridEl.replaceChildren();
+      const frag = document.createDocumentFragment();
+      let cardIdx = 0;
+      for (const item of homeCache.items) {
+        if (loadedIds.has(item.id)) continue;
+        loadedIds.add(item.id);
+        loadedItems.push(item);
+        frag.appendChild(buildMangaCard(item, { index: cardIdx++, noAnim: restoreCache }));
+      }
+      gridEl.appendChild(frag);
+      renderLoadMoreControl();
+      return;
+    }
+
     gridEl.replaceChildren(...buildSkeletonGrid(6).children);
     loadMoreHost.replaceChildren();
     loadedIds.clear();
+    loadedItems.length = 0;
     currentPage = 1;
 
     const [popularRes, latestRes] = await Promise.allSettled([
@@ -705,6 +862,7 @@ async function mountHomeView(container) {
 
     if (popularRes.status === 'fulfilled') {
       cachedPopularList = popularRes.value || [];
+      cachedPopularList.forEach(cacheBook);
       renderHeroBanner(cachedPopularList);
       renderWeeklyUpdate(cachedPopularList);
     }
@@ -725,10 +883,13 @@ async function mountHomeView(container) {
       for (const item of list) {
         if (loadedIds.has(item.id)) continue;
         loadedIds.add(item.id);
+        loadedItems.push(item);
+        cacheBook(item);
         frag.appendChild(buildMangaCard(item, { index: cardIdx++ }));
       }
       gridEl.appendChild(frag);
       renderLoadMoreControl();
+      syncHomeCache();
     } else {
       gridEl.replaceChildren();
       loadMoreHost.replaceChildren(buildErrorPanel(latestRes.reason, loadInitial));
@@ -757,7 +918,7 @@ async function mountHomeView(container) {
 
 // --- Screen 2: Search (`/search`) — Exact Kinetic Search & Discover Empty State ---
 
-async function mountSearchView(container, { q: initialQuery, sort: initialSort }) {
+async function mountSearchView(container, { q: initialQuery, sort: initialSort }, { restoreCache = false, forceRefresh = false } = {}) {
   const cleanups = [];
   let abortController = new AbortController();
   cleanups.push(() => abortController.abort());
@@ -766,8 +927,11 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
   let sort = initialSort || 'popular';
   let currentPage = 1;
   let totalPages = 1;
+  let totalResults = 0;
   let loadingMore = false;
   const loadedIds = new Set();
+  const loadedItems = [];
+  const getCacheKey = () => `${query}|${sort}`;
 
   const searchInput = el('input', {
     type: 'search',
@@ -871,8 +1035,8 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
     const qs = new URLSearchParams();
     if (query) qs.set('q', query);
     if (sort && sort !== 'popular') qs.set('sort', sort);
-    window.history.replaceState(null, '', `/search${qs.toString() ? `?${qs}` : ''}`);
-    runSearch();
+    window.history.replaceState(window.history.state, '', `/search${qs.toString() ? `?${qs}` : ''}`);
+    runSearch(true);
   }
 
   let gridEl = null;
@@ -890,17 +1054,55 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
     }
   }
 
-  async function runSearch() {
+  function syncSearchCache() {
+    if (!query) return;
+    searchCache.set(getCacheKey(), {
+      items: loadedItems.slice(),
+      totalResults,
+      currentPage,
+      totalPages,
+    });
+    if (searchCache.size > 16) {
+      const oldest = searchCache.keys().next().value;
+      searchCache.delete(oldest);
+    }
+  }
+
+  async function runSearch(skipCache = false) {
     abortController.abort();
     abortController = new AbortController();
     loadedIds.clear();
+    loadedItems.length = 0;
     currentPage = 1;
     totalPages = 1;
+    totalResults = 0;
     gridEl = null;
     loadMoreHost.replaceChildren();
 
     if (!query) {
       contentHost.replaceChildren(buildDiscoverEmpty());
+      return;
+    }
+
+    const cached = !skipCache && !forceRefresh ? searchCache.get(getCacheKey()) : null;
+    if (cached?.items?.length) {
+      totalPages = cached.totalPages || 1;
+      currentPage = cached.currentPage || 1;
+      totalResults = cached.totalResults || cached.items.length;
+      gridEl = el('div', { className: 'manga-grid' });
+      const frag = document.createDocumentFragment();
+      let cardIdx = 0;
+      for (const item of cached.items) {
+        loadedIds.add(item.id);
+        loadedItems.push(item);
+        frag.appendChild(buildMangaCard(item, { index: cardIdx++, noAnim: restoreCache }));
+      }
+      gridEl.appendChild(frag);
+      const summary = /^\d+$/.test(query)
+        ? `Gallery #${cached.items[0].id}`
+        : `${formatNumber(totalResults)} kết quả cho "${query}"`;
+      contentHost.replaceChildren(el('p', { className: 'search-summary tabular-nums' }, summary), gridEl);
+      renderLoadMore();
       return;
     }
 
@@ -910,11 +1112,16 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
     if (/^\d+$/.test(query)) {
       try {
         const book = await fetchBook(query, abortController.signal);
+        cacheBook(book);
+        loadedIds.add(book.id);
+        loadedItems.push(book);
+        totalResults = 1;
         gridEl = el('div', { className: 'manga-grid' }, buildMangaCard(book));
         contentHost.replaceChildren(el('p', { className: 'search-summary' }, `Gallery #${book.id}`), gridEl);
+        syncSearchCache();
       } catch (err) {
         if (err.name === 'AbortError') return;
-        contentHost.replaceChildren(buildErrorPanel(err, runSearch));
+        contentHost.replaceChildren(buildErrorPanel(err, () => runSearch(true)));
       }
       return;
     }
@@ -923,6 +1130,7 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
       const data = await searchGalleries(query, 1, sort, abortController.signal);
       totalPages = data.num_pages || 1;
       const items = data.result || [];
+      totalResults = data.total || items.length;
       if (!items.length) {
         contentHost.replaceChildren(
           el('section', { className: 'state-panel' }, el('p', {}, `Không tìm thấy kết quả cho "${query}".`))
@@ -934,17 +1142,20 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
       let cardIdx = 0;
       for (const item of items) {
         loadedIds.add(item.id);
+        loadedItems.push(item);
+        cacheBook(item);
         frag.appendChild(buildMangaCard(item, { index: cardIdx++ }));
       }
       gridEl.appendChild(frag);
       contentHost.replaceChildren(
-        el('p', { className: 'search-summary tabular-nums' }, `${formatNumber(data.total || items.length)} kết quả cho "${query}"`),
+        el('p', { className: 'search-summary tabular-nums' }, `${formatNumber(totalResults)} kết quả cho "${query}"`),
         gridEl
       );
       renderLoadMore();
+      syncSearchCache();
     } catch (err) {
       if (err.name === 'AbortError') return;
-      contentHost.replaceChildren(buildErrorPanel(err, runSearch));
+      contentHost.replaceChildren(buildErrorPanel(err, () => runSearch(true)));
     }
   }
 
@@ -961,9 +1172,12 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
       for (const item of data.result || []) {
         if (loadedIds.has(item.id)) continue;
         loadedIds.add(item.id);
+        loadedItems.push(item);
+        cacheBook(item);
         frag.appendChild(buildMangaCard(item));
       }
       gridEl.appendChild(frag);
+      syncSearchCache();
     } catch (err) {
       if (err.name !== 'AbortError') showToast(err.message || 'Lỗi tải thêm kết quả.', 'error');
     } finally {
@@ -1098,39 +1312,49 @@ async function mountCollectionView(container, kind) {
   return () => revokeObjectUrls(pageWrap);
 }
 
-// --- Screen 6: Detail (`/manga/:id`) — Exact Kinetic Detail Layout ---
+// --- Screen 6: Detail (`/manga/:id`) — Instant Hero Cover Fly-In + Gentle Backdrop & Text Fade ---
 
-async function mountDetailView(container, { id }) {
+async function mountDetailView(container, { id }, { isPop = false, forceRefresh = false } = {}) {
   const cleanups = [];
   const abortController = new AbortController();
   let downloadAbort = null;
   cleanups.push(() => abortController.abort());
   cleanups.push(() => downloadAbort?.abort());
 
-  const pageWrap = el('div', { className: 'detail-layout' });
+  const numId = Number(id);
+  const hero =
+    !isPop &&
+    pendingHeroTransition?.type === 'to-detail' &&
+    pendingHeroTransition.id === numId &&
+    performance.now() - pendingHeroTransition.ts < 1800
+      ? pendingHeroTransition
+      : null;
+  if (hero) pendingHeroTransition = null;
+
+  const pageWrap = el('div', { className: `detail-layout ${isPop ? 'no-entry-anim' : ''}`.trim() });
   container.replaceChildren(pageWrap);
 
-  pageWrap.replaceChildren(
-    el(
-      'div',
-      { className: 'page-container' },
-      el('div', { className: 'state-panel' }, el('div', { className: 'spinner' }), el('p', {}, `Đang tải truyện #${id}...`))
-    )
-  );
-
-  let book = null;
+  const cachedBook = !forceRefresh ? bookMemoryCache.get(numId) : null;
   let meta = await getMetadata(id);
+  let book = cachedBook?.pages?.length
+    ? cachedBook
+    : hero?.book || cachedBook || meta?.bookJson || null;
   let offlineFallbackUsed = false;
 
-  try {
-    book = await fetchBook(id, abortController.signal);
-    meta = await upsertMetadata(book);
-  } catch (err) {
-    if (err.name === 'AbortError') return () => {};
-    if (meta?.bookJson) {
-      book = meta.bookJson;
-      offlineFallbackUsed = true;
-    } else {
+  if (!book) {
+    pageWrap.replaceChildren(
+      el(
+        'div',
+        { className: 'page-container' },
+        el('div', { className: 'state-panel' }, el('div', { className: 'spinner' }), el('p', {}, `Đang tải truyện #${id}...`))
+      )
+    );
+    try {
+      book = await fetchBook(id, abortController.signal);
+      cacheBook(book);
+      meta = await upsertMetadata(book);
+    } catch (err) {
+      if (err.name === 'AbortError') return () => {};
       pageWrap.replaceChildren(
         el('div', { className: 'page-container' }, buildErrorPanel(err, () => navigate(`/manga/${id}`, { replace: true })))
       );
@@ -1138,13 +1362,12 @@ async function mountDetailView(container, { id }) {
     }
   }
 
-  const title = getBookTitle(book);
-  const subTitle = getBookSubTitle(book);
-  const coverUrl = getBookCoverUrl(book);
-  const totalPages = book.num_pages || book.pages?.length || meta?.totalPages || 0;
   let isFavorite = Boolean(meta?.isFavorite);
   let isDownloaded = Boolean(meta?.isDownloaded);
-  const lastReadPage = meta?.lastReadPage || 0;
+  let lastReadPage = meta?.lastReadPage || 0;
+  let totalPages = book.num_pages || book.pages?.length || meta?.totalPages || 0;
+  const title = getBookTitle(book);
+  const initialCoverUrl = hero?.imgSrc || getBookCoverUrl(book);
 
   const downloadStatusEl = el('p', { className: 'download-progress-text' });
   let downloading = false;
@@ -1169,6 +1392,10 @@ async function mountDetailView(container, { id }) {
           downloadBtn.classList.remove('is-downloaded');
           downloadStatusEl.textContent = '';
           showToast('Đã xóa bản lưu offline.');
+          return;
+        }
+        if (!book?.pages?.length) {
+          showToast('Đang tải dữ liệu trang, thử lại sau giây lát.');
           return;
         }
         downloading = true;
@@ -1230,161 +1457,259 @@ async function mountDetailView(container, { id }) {
         type: 'button',
         className: 'detail-circle-btn glass-clear',
         'aria-label': 'Quay lại',
-        onClick: () => (window.history.length > 1 ? window.history.back() : navigate('/')),
+        onClick: () => goBack('/'),
       },
       svgIcon('back', 19)
     ),
     el('div', { className: 'detail-top-right' }, downloadBtn, favBtn)
   );
 
+  // Blurred cover backdrop fades in gently behind header (never flies)
+  const bannerBackdrop = initialCoverUrl
+    ? el('img', {
+        src: initialCoverUrl,
+        alt: '',
+        className: 'detail-banner-bg',
+        referrerPolicy: 'no-referrer',
+        'aria-hidden': 'true',
+      })
+    : null;
+
+  const bannerWash = el(
+    'div',
+    { className: 'detail-banner-wash' },
+    bannerBackdrop,
+    el('div', { className: 'detail-banner-scrim', 'aria-hidden': 'true' }),
+    topActionRow
+  );
+
+  const coverImg = createMangaImg(initialCoverUrl, title, {
+    priority: 'high',
+    className: 'detail-cover-img',
+    width: 240,
+    height: 340,
+  });
+  const coverBox = el('div', { className: `detail-cover-box ${hero ? 'is-hero-flying' : ''}`.trim() }, coverImg);
+
+  const offlinePillSlot = el('span', { className: 'offline-pill', hidden: !offlineFallbackUsed }, 'Offline Cache');
+  const titleEl = el('h1', { className: 'detail-title detail-fade-in', style: { '--fade-delay': '80ms' } }, title);
+  const subTitleEl = el(
+    'p',
+    { className: 'detail-subtitle detail-fade-in', style: { '--fade-delay': '130ms' }, hidden: !getBookSubTitle(book) },
+    getBookSubTitle(book) || ''
+  );
+  const statsRow = el('div', {
+    className: 'detail-inline-stats tabular-nums detail-fade-in',
+    style: { '--fade-delay': '170ms' },
+  });
+
+  function renderStats(b) {
+    totalPages = b.num_pages || b.pages?.length || meta?.totalPages || 0;
+    const sub = getBookSubTitle(b);
+    subTitleEl.textContent = sub || '';
+    subTitleEl.hidden = !sub;
+    statsRow.replaceChildren(
+      el('span', { className: 'inline-stat gold' }, svgIcon('book', 14), `${totalPages} pgs`),
+      el('span', { className: 'inline-stat pink' }, svgIcon('heart', 14), formatNumber(b.num_favorites || 0)),
+      b.upload_date ? el('span', { className: 'inline-stat muted' }, formatUnixDate(b.upload_date)) : null
+    );
+  }
+  renderStats(book);
+
   const heroRow = el(
     'div',
     { className: 'detail-header-row' },
-    el(
-      'div',
-      { className: 'detail-cover-box' },
-      createMangaImg(coverUrl, title, { priority: 'high', className: 'detail-cover-img', width: 240, height: 340 })
-    ),
-    el(
-      'div',
-      { className: 'detail-meta-col' },
-      offlineFallbackUsed ? el('span', { className: 'offline-pill' }, 'Offline Cache') : null,
-      el('h1', { className: 'detail-title' }, title),
-      subTitle ? el('p', { className: 'detail-subtitle' }, subTitle) : null,
-      el(
-        'div',
-        { className: 'detail-inline-stats tabular-nums' },
-        el('span', { className: 'inline-stat gold' }, svgIcon('book', 14), `${totalPages} pgs`),
-        el('span', { className: 'inline-stat pink' }, svgIcon('heart', 14), formatNumber(book.num_favorites || 0)),
-        book.upload_date ? el('span', { className: 'inline-stat muted' }, formatUnixDate(book.upload_date)) : null
-      )
-    )
+    coverBox,
+    el('div', { className: 'detail-meta-col' }, offlinePillSlot, titleEl, subTitleEl, statsRow)
   );
 
+  const readCtaLabel = el('span', {}, lastReadPage > 0 ? `CONTINUE READING (PG ${lastReadPage})` : 'READ NOW');
   const readCtaBtn = el(
     'button',
     {
       type: 'button',
-      className: 'read-now-cta',
-      onClick: () => navigate(`/read/${book.id}/${Math.max(1, lastReadPage || 1)}`),
+      className: 'read-now-cta detail-fade-in',
+      style: { '--fade-delay': '200ms' },
+      onClick: () => {
+        const startPage = Math.max(1, lastReadPage || 1);
+        // Fly the Detail cover down into Page 1 when starting from Page 1
+        openBookReader(book, startPage, startPage === 1 ? coverBox : null);
+      },
     },
     svgIcon('play', 18),
-    lastReadPage > 0 ? `CONTINUE READING (PG ${lastReadPage})` : 'READ NOW'
+    readCtaLabel
   );
 
-  const tags = book.tags || [];
-  const tagsSection = tags.length
-    ? el(
-        'section',
-        { className: 'detail-section' },
+  const tagsHost = el('div', { className: 'detail-slot detail-fade-in', style: { '--fade-delay': '240ms' } });
+  const previewHost = el('div', { className: 'detail-slot detail-fade-in', style: { '--fade-delay': '280ms' } });
+  const relatedSection = el('section', { className: 'detail-section detail-fade-in', style: { '--fade-delay': '320ms' } });
+
+  function renderFullSections(fullBook) {
+    const tags = fullBook.tags || [];
+    if (tags.length) {
+      tagsHost.replaceChildren(
         el(
-          'div',
-          { className: 'kinetic-section-head' },
-          el('h2', { className: 'kinetic-section-title' }, 'Tags'),
-          el('span', { className: 'tags-count-label tabular-nums' }, `(${tags.length})`)
-        ),
-        el(
-          'div',
-          { className: 'dot-tags-wrap' },
-          ...tags.map((t, i) =>
-            el(
-              'button',
-              {
-                type: 'button',
-                className: 'dot-tag-chip',
-                onClick: () => navigate(`/search?q=${encodeURIComponent(t.name || '')}`),
-              },
-              el('span', { className: 'tag-color-dot', style: { backgroundColor: TAG_DOT_COLORS[i % TAG_DOT_COLORS.length] }, 'aria-hidden': 'true' }),
-              el('span', {}, t.name || '')
+          'section',
+          { className: 'detail-section' },
+          el(
+            'div',
+            { className: 'kinetic-section-head' },
+            el('h2', { className: 'kinetic-section-title' }, 'Tags'),
+            el('span', { className: 'tags-count-label tabular-nums' }, `(${tags.length})`)
+          ),
+          el(
+            'div',
+            { className: 'dot-tags-wrap' },
+            ...tags.map((t, i) =>
+              el(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dot-tag-chip',
+                  onClick: () => navigate(`/search?q=${encodeURIComponent(t.name || '')}`),
+                },
+                el('span', { className: 'tag-color-dot', style: { backgroundColor: TAG_DOT_COLORS[i % TAG_DOT_COLORS.length] }, 'aria-hidden': 'true' }),
+                el('span', {}, t.name || '')
+              )
             )
           )
         )
-      )
-    : null;
-
-  // Preview thumbnails
-  const pagesList = book.pages || [];
-  let previewLimit = Math.min(20, pagesList.length);
-  const thumbsGrid = el('div', { className: 'thumb-preview-grid' });
-  const moreThumbsWrap = el('div', { className: 'load-more-host' });
-
-  function renderPreviewThumbs() {
-    thumbsGrid.replaceChildren();
-    const frag = document.createDocumentFragment();
-    for (let i = 0; i < previewLimit; i++) {
-      const p = pagesList[i];
-      frag.appendChild(
-        el(
-          'a',
-          {
-            href: `/read/${book.id}/${p.number}`,
-            className: 'page-thumb-card',
-            onClick: (e) => {
-              if (e.metaKey || e.ctrlKey) return;
-              e.preventDefault();
-              navigate(`/read/${book.id}/${p.number}`);
-            },
-          },
-          createMangaImg(fullThumbUrl(p.thumbnail || p.path, book.media_id), `Trang ${p.number}`, { priority: 'lazy', className: 'page-thumb-img', width: 140, height: 200 }),
-          el('span', { className: 'page-thumb-num tabular-nums' }, String(p.number))
-        )
       );
+    } else {
+      tagsHost.replaceChildren();
     }
-    thumbsGrid.appendChild(frag);
 
-    moreThumbsWrap.replaceChildren();
-    if (previewLimit < pagesList.length) {
-      moreThumbsWrap.appendChild(
-        el(
-          'button',
-          {
-            type: 'button',
-            className: 'btn btn-surface',
-            onClick: () => {
-              previewLimit = pagesList.length;
-              renderPreviewThumbs();
+    const pagesList = fullBook.pages || [];
+    if (!pagesList.length) {
+      previewHost.replaceChildren();
+      return;
+    }
+
+    let previewLimit = Math.min(20, pagesList.length);
+    const thumbsGrid = el('div', { className: 'thumb-preview-grid' });
+    const moreThumbsWrap = el('div', { className: 'load-more-host' });
+
+    function renderPreviewThumbs() {
+      thumbsGrid.replaceChildren();
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < previewLimit; i++) {
+        const p = pagesList[i];
+        frag.appendChild(
+          el(
+            'a',
+            {
+              href: `/read/${fullBook.id}/${p.number}`,
+              className: 'page-thumb-card',
+              onClick: (e) => {
+                if (e.metaKey || e.ctrlKey) return;
+                e.preventDefault();
+                openBookReader(fullBook, p.number, p.number === 1 ? coverBox : e.currentTarget);
+              },
             },
-          },
-          `Xem tất cả ${pagesList.length} trang`
-        )
-      );
-    }
-  }
-  renderPreviewThumbs();
+            createMangaImg(fullThumbUrl(p.thumbnail || p.path, fullBook.media_id), `Trang ${p.number}`, { priority: 'lazy', className: 'page-thumb-img', width: 140, height: 200 }),
+            el('span', { className: 'page-thumb-num tabular-nums' }, String(p.number))
+          )
+        );
+      }
+      thumbsGrid.appendChild(frag);
 
-  const previewSection = pagesList.length
-    ? el(
+      moreThumbsWrap.replaceChildren();
+      if (previewLimit < pagesList.length) {
+        moreThumbsWrap.appendChild(
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'btn btn-surface',
+              onClick: () => {
+                previewLimit = pagesList.length;
+                renderPreviewThumbs();
+              },
+            },
+            `Xem tất cả ${pagesList.length} trang`
+          )
+        );
+      }
+    }
+    renderPreviewThumbs();
+
+    previewHost.replaceChildren(
+      el(
         'section',
         { className: 'detail-section' },
         el('div', { className: 'kinetic-section-head' }, el('h2', { className: 'kinetic-section-title' }, `Preview (${pagesList.length})`)),
         thumbsGrid,
         moreThumbsWrap
       )
-    : null;
-
-  const relatedSection = el('section', { className: 'detail-section' });
+    );
+  }
 
   pageWrap.replaceChildren(
-    el('div', { className: 'detail-banner-wash' }, topActionRow),
+    bannerWash,
     el(
       'div',
       { className: 'page-container detail-body-container' },
       heroRow,
       readCtaBtn,
       downloadStatusEl,
-      tagsSection,
-      previewSection,
+      tagsHost,
+      previewHost,
       relatedSection
     )
   );
 
+  // Run GPU-composited Menu Cover -> Detail Cover flight immediately using already-decoded cover
+  if (hero?.fromRect && hero.imgSrc) {
+    const cancelFly = runHeroFlyTransition({
+      imgSrc: hero.imgSrc,
+      fromRect: hero.fromRect,
+      toEl: coverBox,
+      fromRadius: hero.borderRadius || '14px',
+      toRadius: '16px',
+      duration: 360,
+      objectFit: 'cover',
+      onFinish: () => coverBox.classList.remove('is-hero-flying'),
+    });
+    cleanups.push(cancelFly);
+  }
+
+  if (book.pages?.length || book.tags?.length) {
+    renderFullSections(book);
+  }
+
+  // Silently hydrate full book data (tags + pages + fresh stats) without reloading cover or flashing spinner
+  if (forceRefresh || !book.pages?.length || !book.tags?.length) {
+    fetchBook(id, abortController.signal)
+      .then(async (fullBook) => {
+        if (abortController.signal.aborted) return;
+        book = fullBook;
+        cacheBook(fullBook);
+        meta = await upsertMetadata(fullBook);
+        lastReadPage = meta?.lastReadPage || lastReadPage;
+        readCtaLabel.textContent = lastReadPage > 0 ? `CONTINUE READING (PG ${lastReadPage})` : 'READ NOW';
+        renderStats(fullBook);
+        renderFullSections(fullBook);
+      })
+      .catch(() => {
+        if (abortController.signal.aborted) return;
+        if (meta?.bookJson) {
+          book = meta.bookJson;
+          offlineFallbackUsed = true;
+          offlinePillSlot.hidden = false;
+          renderStats(book);
+          renderFullSections(book);
+        }
+      });
+  }
+
   if (!offlineFallbackUsed) {
     fetchRelated(id, abortController.signal)
       .then((related) => {
-        if (!related?.length) return;
+        if (abortController.signal.aborted || !related?.length) return;
+        related.forEach(cacheBook);
         relatedSection.replaceChildren(
           el('div', { className: 'kinetic-section-head' }, el('h2', { className: 'kinetic-section-title' }, 'Related Manga')),
-          el('div', { className: 'manga-grid' }, ...related.slice(0, 12).map((b) => buildMangaCard(b)))
+          el('div', { className: 'manga-grid' }, ...related.slice(0, 12).map((b, idx) => buildMangaCard(b, { index: idx, noAnim: isPop })))
         );
       })
       .catch(() => {});
@@ -1442,35 +1767,193 @@ function renderDrawerInstallControl() {
 
 // --- Router Dispatcher ---
 
-async function renderRoute() {
+async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
   if (typeof activeCleanup === 'function') {
     activeCleanup();
     activeCleanup = null;
   }
 
+  if (window.history.state?.navId) {
+    currentNavId = window.history.state.navId;
+  }
+
   const route = parseRoute(window.location.pathname, window.location.search);
   updateActiveNav(route.name);
-  window.scrollTo({ top: 0, behavior: 'instant' });
-  if (appStage) appStage.scrollTop = 0;
+
+  if (!isPop && !forceRefresh) {
+    setScrollTop(0);
+  }
+  syncHeaderChromeFn?.();
 
   await refreshLibraryStats();
 
   if (route.name === 'home') {
-    activeCleanup = await mountHomeView(appMain);
+    if (forceRefresh) homeCache = null;
+    activeCleanup = await mountHomeView(appMain, { restoreCache: isPop, forceRefresh });
   } else if (route.name === 'search') {
-    activeCleanup = await mountSearchView(appMain, route.params);
+    if (forceRefresh) searchCache.delete(`${route.params.q || ''}|${route.params.sort || 'popular'}`);
+    activeCleanup = await mountSearchView(appMain, route.params, { restoreCache: isPop, forceRefresh });
   } else if (route.name === 'favorites' || route.name === 'history' || route.name === 'downloads') {
     activeCleanup = await mountCollectionView(appMain, route.name);
   } else if (route.name === 'detail') {
-    activeCleanup = await mountDetailView(appMain, route.params);
+    activeCleanup = await mountDetailView(appMain, route.params, { isPop, forceRefresh });
   } else if (route.name === 'reader') {
-    activeCleanup = await mountReaderView(appMain, route.params, navigate);
+    const numId = Number(route.params.id);
+    const readerHero =
+      !isPop &&
+      pendingHeroTransition?.type === 'to-reader' &&
+      pendingHeroTransition.id === numId &&
+      performance.now() - pendingHeroTransition.ts < 1800
+        ? pendingHeroTransition
+        : null;
+    if (readerHero) pendingHeroTransition = null;
+    const initialBook = readerHero?.book?.pages?.length
+      ? readerHero.book
+      : bookMemoryCache.get(numId) || null;
+    activeCleanup = await mountReaderView(appMain, route.params, navigate, {
+      initialBook,
+      heroTransition: readerHero,
+      goBack,
+    });
   }
+
+  // Deterministically restore exact scroll position when going Back (Menu / Tag / Detail)
+  if (isPop && route.name !== 'reader') {
+    const savedY = scrollPositions.get(currentNavId) || 0;
+    requestAnimationFrame(() => {
+      setScrollTop(savedY);
+      syncHeaderChromeFn?.();
+    });
+  } else {
+    requestAnimationFrame(() => syncHeaderChromeFn?.());
+  }
+}
+
+// --- Native Rubber-Band Pull-to-Refresh (List & Detail screens, disabled in Reader) ---
+
+function wirePullToRefresh() {
+  const ptrIcon = el('span', { className: 'ptr-icon', 'aria-hidden': 'true' }, svgIcon('refresh', 17));
+  const ptrText = el('span', { className: 'ptr-text' }, 'Kéo để làm mới');
+  const ptrEl = el('div', { id: 'ptr-indicator', className: 'ptr-indicator', 'aria-hidden': 'true' }, ptrIcon, ptrText);
+  document.body.appendChild(ptrEl);
+
+  const THRESHOLD = 58;
+  let tracking = false;
+  let pulling = false;
+  let refreshing = false;
+  let startX = 0;
+  let startY = 0;
+  let currentPull = 0;
+
+  function resetIndicator() {
+    ptrEl.classList.remove('is-dragging', 'is-ready', 'is-refreshing');
+    ptrEl.style.transform = '';
+    ptrEl.style.opacity = '';
+    ptrIcon.style.transform = '';
+    ptrText.textContent = 'Kéo để làm mới';
+  }
+
+  document.addEventListener(
+    'touchstart',
+    (e) => {
+      if (refreshing || !e.touches || e.touches.length !== 1) return;
+      if (appShell.classList.contains('is-reader-route') || appSheet.open || appShell.classList.contains('drawer-open')) return;
+      if (e.touches[0].clientX <= 24) return; // Reserve left edge strictly for Back swipe
+      if (e.target.closest('.carousel-track, .weekly-track, input, textarea, select')) return;
+      if (getScrollTop() > 2) return;
+      tracking = true;
+      pulling = false;
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+      currentPull = 0;
+    },
+    { passive: true }
+  );
+
+  document.addEventListener(
+    'touchmove',
+    (e) => {
+      if (!tracking || refreshing || !e.touches || e.touches.length !== 1) return;
+      const dx = e.touches[0].clientX - startX;
+      const dy = e.touches[0].clientY - startY;
+
+      if (!pulling) {
+        if (dy < 8 || Math.abs(dx) > Math.abs(dy) * 0.85 || getScrollTop() > 2) {
+          if (dy < -4 || Math.abs(dx) > 12) tracking = false;
+          return;
+        }
+        pulling = true;
+        ptrEl.classList.add('is-dragging');
+      }
+
+      if (dy <= 0) {
+        currentPull = 0;
+        resetIndicator();
+        return;
+      }
+
+      e.preventDefault();
+      currentPull = rubberband(dy, 155, 0.55);
+      const ready = currentPull >= THRESHOLD;
+      ptrEl.classList.toggle('is-ready', ready);
+      ptrEl.style.opacity = String(Math.min(1, currentPull / 38));
+      ptrEl.style.transform = `translate3d(-50%, ${(currentPull - 44).toFixed(1)}px, 0)`;
+      ptrIcon.style.transform = `rotate(${(currentPull * 3.4).toFixed(0)}deg)`;
+      ptrText.textContent = ready ? 'Thả để tải lại' : 'Kéo để làm mới';
+    },
+    { passive: false }
+  );
+
+  async function finishPull() {
+    if (!tracking) return;
+    tracking = false;
+    if (!pulling) return;
+    pulling = false;
+    ptrEl.classList.remove('is-dragging');
+
+    if (currentPull >= THRESHOLD && !refreshing) {
+      refreshing = true;
+      ptrEl.classList.add('is-refreshing');
+      ptrEl.style.opacity = '1';
+      ptrEl.style.transform = 'translate3d(-50%, 16px, 0)';
+      ptrText.textContent = 'Đang làm mới...';
+      try {
+        await renderRoute({ isPop: false, forceRefresh: true });
+        showToast('Đã làm mới trang.', 'success');
+      } finally {
+        refreshing = false;
+        currentPull = 0;
+        resetIndicator();
+      }
+    } else {
+      currentPull = 0;
+      resetIndicator();
+    }
+  }
+
+  document.addEventListener('touchend', finishPull, { passive: true });
+  document.addEventListener('touchcancel', () => {
+    tracking = false;
+    pulling = false;
+    currentPull = 0;
+    if (!refreshing) resetIndicator();
+  }, { passive: true });
 }
 
 // --- Boot ---
 
 function boot() {
+  if ('scrollRestoration' in window.history) {
+    window.history.scrollRestoration = 'manual';
+  }
+  if (!window.history.state?.navId) {
+    window.history.replaceState(
+      { navId: currentNavId, stackIdx: 0 },
+      '',
+      `${window.location.pathname}${window.location.search}`
+    );
+  }
+
   wireIosSheet(appSheet);
   document.getElementById('app-sheet-close')?.addEventListener('click', () => closeTopLayer(appSheet));
 
@@ -1509,25 +1992,44 @@ function boot() {
     renderDrawerInstallControl();
   });
 
-  const updateScrollChrome = () => {
-    const scrollPos = Math.max(window.scrollY, appStage?.scrollTop || 0);
-    topHeader?.classList.toggle('is-scrolled', scrollPos > 160);
+  // Smooth progressive header opacity (0 -> 1) on Home scroll + continuous scroll-position saving
+  let headerRaf = 0;
+  const applyHeaderChrome = () => {
+    headerRaf = 0;
+    const isHome = appShell.classList.contains('is-home-route');
+    const scrollPos = getScrollTop();
+    if (!appShell.classList.contains('is-reader-route')) {
+      scrollPositions.set(currentNavId, scrollPos);
+    }
+    if (!isHome) {
+      topHeader?.style.setProperty('--header-p', '1');
+      topHeader?.classList.toggle('is-scrolled', scrollPos > 8);
+      return;
+    }
+    const p = Math.max(0, Math.min(1, (scrollPos - 36) / 160));
+    topHeader?.style.setProperty('--header-p', p.toFixed(3));
+    topHeader?.classList.toggle('is-scrolled', p > 0.55);
   };
-  window.addEventListener('scroll', updateScrollChrome, { passive: true });
-  appStage?.addEventListener('scroll', updateScrollChrome, { passive: true });
-  updateScrollChrome();
+  syncHeaderChromeFn = applyHeaderChrome;
+  const onScrollChrome = () => {
+    if (!headerRaf) headerRaf = requestAnimationFrame(applyHeaderChrome);
+  };
+  window.addEventListener('scroll', onScrollChrome, { passive: true });
+  appStage?.addEventListener('scroll', onScrollChrome, { passive: true });
+  applyHeaderChrome();
 
-  // Left-edge swipe-back (nested pages) or swipe-open drawer (Home) on touch
+  // Single-purpose iPhone left-edge swipe: ONLY goes Back (locked on Home, never opens drawer!)
   let edgeStartX = 0;
   let edgeStartY = 0;
   let edgeTracking = false;
   document.addEventListener(
     'touchstart',
     (e) => {
-      if (e.touches.length !== 1) return;
-      if (appShell.classList.contains('is-reader-route') || appSheet.open) return;
+      if (!e.touches || e.touches.length !== 1) return;
+      if (appSheet.open || appShell.classList.contains('drawer-open')) return;
+      if (appShell.classList.contains('is-home-route')) return; // Locked on Home
       if (e.target.closest('.carousel-track, .weekly-track, input, select')) return;
-      if (e.touches[0].clientX <= 26) {
+      if (e.touches[0].clientX <= 24) {
         edgeTracking = true;
         edgeStartX = e.touches[0].clientX;
         edgeStartY = e.touches[0].clientY;
@@ -1540,17 +2042,21 @@ function boot() {
   document.addEventListener(
     'touchend',
     (e) => {
-      if (!edgeTracking || e.changedTouches.length !== 1) return;
+      if (!edgeTracking || !e.changedTouches || e.changedTouches.length !== 1) return;
       edgeTracking = false;
       const dx = e.changedTouches[0].clientX - edgeStartX;
       const dy = e.changedTouches[0].clientY - edgeStartY;
-      if (dx > 72 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-        if (window.location.pathname !== '/') window.history.back();
-        else openMobileDrawer();
+      if (dx > 68 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        goBack('/');
       }
     },
     { passive: true }
   );
+  document.addEventListener('touchcancel', () => {
+    edgeTracking = false;
+  }, { passive: true });
+
+  wirePullToRefresh();
 
   // macOS / PC keyboard shortcuts
   window.addEventListener('keydown', (e) => {
@@ -1584,12 +2090,18 @@ function boot() {
     link.addEventListener('click', (e) => {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       e.preventDefault();
-      navigate(link.getAttribute('href') || '/');
+      const href = link.getAttribute('href') || '/';
+      if (href === '/' && `${window.location.pathname}${window.location.search}` === '/') {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        appStage?.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+      navigate(href);
     });
   }
 
-  window.addEventListener('popstate', () => renderRoute());
-  renderRoute();
+  window.addEventListener('popstate', () => renderRoute({ isPop: true }));
+  renderRoute({ isPop: false });
 }
 
 boot();

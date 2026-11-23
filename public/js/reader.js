@@ -15,6 +15,8 @@ import {
   el,
   svgIcon,
   rubberband,
+  computePreloadOrder,
+  runHeroFlyTransition,
   revokeObjectUrls,
   showToast,
 } from './dom.js';
@@ -28,8 +30,50 @@ const EYE_FILTERS = [
 
 const AUTO_SPEEDS = [1, 2, 3, 4, 5];
 
-function createPageImg(page, mediaId, priority = 'lazy') {
+function hydratePageImg(img, page, mediaId, priority = 'auto') {
+  if (!img || img.dataset.hydrated === '1') return Promise.resolve();
   const remoteUrl = fullImageUrl(page.path, mediaId);
+  if (!remoteUrl) return Promise.resolve();
+  img.dataset.hydrated = '1';
+
+  if (priority === 'high') {
+    img.setAttribute('fetchpriority', 'high');
+    img.removeAttribute('loading');
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      img.style.backgroundImage = '';
+      resolve();
+    };
+
+    let triedProxy = false;
+    img.addEventListener('load', finish, { once: true });
+    img.addEventListener('error', () => {
+      if (!triedProxy && remoteUrl) {
+        triedProxy = true;
+        img.src = proxyImageUrl(remoteUrl);
+      } else {
+        img.classList.add('img-error');
+        finish();
+      }
+    });
+
+    getCachedImageObjectUrl(remoteUrl).then((objUrl) => {
+      if (objUrl) {
+        img.dataset.objectUrl = objUrl;
+        img.src = objUrl;
+      }
+    });
+    img.src = remoteUrl;
+    if (img.complete && img.naturalWidth > 0) finish();
+  });
+}
+
+function createPageImg(page, mediaId, { priority = 'lazy', deferLoad = false, previewCoverUrl = '' } = {}) {
   const img = document.createElement('img');
   img.alt = `Trang ${page.number}`;
   img.className = 'reader-page-img';
@@ -40,39 +84,35 @@ function createPageImg(page, mediaId, priority = 'lazy') {
     img.width = page.width;
     img.height = page.height;
     img.style.aspectRatio = `${page.width} / ${page.height}`;
+  } else {
+    img.style.aspectRatio = '5 / 7';
   }
-  if (priority === 'high') {
-    img.setAttribute('fetchpriority', 'high');
-  } else if (priority === 'lazy') {
-    img.loading = 'lazy';
+  if (previewCoverUrl) {
+    img.style.backgroundImage = `url("${previewCoverUrl.replace(/"/g, '\\"')}")`;
+    img.style.backgroundSize = 'contain';
+    img.style.backgroundPosition = 'center';
+    img.style.backgroundRepeat = 'no-repeat';
   }
-
-  let triedProxy = false;
-  img.addEventListener('error', () => {
-    if (!triedProxy && remoteUrl) {
-      triedProxy = true;
-      img.src = proxyImageUrl(remoteUrl);
-    } else {
-      img.classList.add('img-error');
-    }
-  });
-
-  if (remoteUrl) {
-    getCachedImageObjectUrl(remoteUrl).then((objUrl) => {
-      if (objUrl) {
-        img.dataset.objectUrl = objUrl;
-        img.src = objUrl;
-      }
-    });
-    img.src = remoteUrl;
+  if (!deferLoad) {
+    hydratePageImg(img, page, mediaId, priority);
   }
   return img;
 }
 
-export async function mountReaderView(container, { id, page: initialPage }, navigate) {
+export async function mountReaderView(
+  container,
+  { id, page: initialPage },
+  navigate,
+  { initialBook = null, heroTransition = null, goBack = null } = {}
+) {
   const cleanups = [];
   const abortController = new AbortController();
   cleanups.push(() => abortController.abort());
+
+  const exitToDetail = () => {
+    if (goBack) goBack(`/manga/${id}`);
+    else navigate(`/manga/${id}`, { replace: true });
+  };
 
   const prefs = loadReaderPrefs();
   let mode = prefs.mode; // 'horizontal' (Page Flip) | 'vertical' (Webtoon)
@@ -86,7 +126,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   let panX = 0;
   let panY = 0;
   let currentPage = Math.max(1, Number(initialPage) || 1);
-  let book = null;
+  let book = initialBook?.pages?.length ? initialBook : null;
   let totalPages = 0;
 
   let rafId = 0;
@@ -100,48 +140,50 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   });
   container.replaceChildren(root);
 
-  root.appendChild(
-    el(
-      'div',
-      { className: 'reader-status-box' },
-      el('div', { className: 'spinner', 'aria-hidden': 'true' }),
-      el('p', {}, 'Đang tải trang truyện...')
-    )
-  );
-
-  try {
-    const meta = await getMetadata(id);
-    if (meta?.bookJson?.pages?.length) {
-      book = meta.bookJson;
-    } else {
-      book = await fetchBook(id, abortController.signal);
-    }
-  } catch (err) {
-    if (err.name === 'AbortError') return () => {};
-    root.replaceChildren(
+  if (!book) {
+    root.appendChild(
       el(
         'div',
-        { className: 'reader-status-box error-panel' },
-        el('h2', {}, 'Không tải được chương truyện'),
-        el('p', {}, err.message),
-        err.hint ? el('p', { className: 'muted-hint' }, err.hint) : null,
-        el(
-          'div',
-          { className: 'btn-row' },
-          el(
-            'button',
-            { type: 'button', className: 'btn btn-primary', onClick: () => navigate(`/read/${id}/${currentPage}`, { replace: true }) },
-            'Thử lại'
-          ),
-          el(
-            'button',
-            { type: 'button', className: 'btn btn-ghost', onClick: () => navigate(`/manga/${id}`) },
-            'Về trang chi tiết'
-          )
-        )
+        { className: 'reader-status-box' },
+        el('div', { className: 'spinner', 'aria-hidden': 'true' }),
+        el('p', {}, 'Đang tải trang truyện...')
       )
     );
-    return () => cleanups.forEach((fn) => fn());
+
+    try {
+      const meta = await getMetadata(id);
+      if (meta?.bookJson?.pages?.length) {
+        book = meta.bookJson;
+      } else {
+        book = await fetchBook(id, abortController.signal);
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') return () => {};
+      root.replaceChildren(
+        el(
+          'div',
+          { className: 'reader-status-box error-panel' },
+          el('h2', {}, 'Không tải được chương truyện'),
+          el('p', {}, err.message),
+          err.hint ? el('p', { className: 'muted-hint' }, err.hint) : null,
+          el(
+            'div',
+            { className: 'btn-row' },
+            el(
+              'button',
+              { type: 'button', className: 'btn btn-primary', onClick: () => navigate(`/read/${id}/${currentPage}`, { replace: true }) },
+              'Thử lại'
+            ),
+            el(
+              'button',
+              { type: 'button', className: 'btn btn-ghost', onClick: exitToDetail },
+              'Về trang chi tiết'
+            )
+          )
+        )
+      );
+      return () => cleanups.forEach((fn) => fn());
+    }
   }
 
   const pages = book?.pages || [];
@@ -152,7 +194,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         'div',
         { className: 'reader-status-box' },
         el('p', {}, 'Truyện này chưa có dữ liệu trang ảnh.'),
-        el('button', { type: 'button', className: 'btn btn-primary', onClick: () => navigate(`/manga/${id}`) }, 'Quay lại')
+        el('button', { type: 'button', className: 'btn btn-primary', onClick: exitToDetail }, 'Quay lại')
       )
     );
     return () => cleanups.forEach((fn) => fn());
@@ -220,7 +262,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         type: 'button',
         className: 'reader-back-btn',
         'aria-label': 'Quay lại chi tiết truyện',
-        onClick: () => navigate(`/manga/${id}`),
+        onClick: exitToDetail,
       },
       svgIcon('back', 20)
     ),
@@ -408,29 +450,125 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
     const nextUrl = `/read/${id}/${currentPage}`;
     if (window.location.pathname !== nextUrl) {
-      window.history.replaceState(null, '', nextUrl);
+      // Preserve history.state so reading many pages never pollutes the Back stack
+      window.history.replaceState(window.history.state, '', nextUrl);
     }
     updateHistory(book, currentPage, totalPages).catch(() => {});
-    preloadAdjacentPages(currentPage);
+    scheduleSlidingPreload(currentPage);
   }
 
-  const preloadedUrls = new Set();
-  function preloadAdjacentPages(pageNum) {
-    for (const offset of [1, 2]) {
-      const target = pages[pageNum - 1 + offset];
-      if (!target) continue;
-      const url = fullImageUrl(target.path, book.media_id);
-      if (!url || preloadedUrls.has(url)) continue;
-      preloadedUrls.add(url);
+  // Sliding-window sequential preloader:
+  // Page 1 -> preloads 2, 3, 4, 5; Page 4 -> preloads 5, 6, 7, 8 and ensures 3, 2, 1 behind.
+  const retainedPreloads = new Map();
+  const verticalImgMap = new Map();
+  const inFlightPreloads = new Set();
+  const MAX_PRELOAD_CONCURRENCY = 2;
+  let preloadPriorityList = [];
+  let unmounted = false;
+  cleanups.push(() => {
+    unmounted = true;
+    retainedPreloads.clear();
+    verticalImgMap.clear();
+    inFlightPreloads.clear();
+  });
+
+  function preloadSinglePage(pageNum) {
+    const p = pages[pageNum - 1];
+    if (!p) return Promise.resolve();
+
+    // Hydrate vertical DOM img directly if present
+    const domImg = verticalImgMap.get(pageNum);
+    if (domImg && domImg.dataset.hydrated !== '1') {
+      return hydratePageImg(domImg, p, book.media_id, 'auto');
+    }
+
+    if (retainedPreloads.has(pageNum)) return Promise.resolve();
+    const url = fullImageUrl(p.path, book.media_id);
+    if (!url) return Promise.resolve();
+
+    return new Promise((resolve) => {
       const preload = new Image();
       preload.referrerPolicy = 'no-referrer';
+      preload.decoding = 'async';
+      retainedPreloads.set(pageNum, preload);
+      let triedProxy = false;
+      const done = () => resolve();
+      preload.addEventListener('load', done, { once: true });
+      preload.addEventListener('error', () => {
+        if (!triedProxy) {
+          triedProxy = true;
+          preload.src = proxyImageUrl(url);
+        } else {
+          done();
+        }
+      });
       preload.src = url;
+      if (preload.complete && preload.naturalWidth > 0) done();
+    });
+  }
+
+  function pumpPreloadQueue() {
+    if (unmounted) return;
+    while (inFlightPreloads.size < MAX_PRELOAD_CONCURRENCY) {
+      const nextNum = preloadPriorityList.find((num) => {
+        if (inFlightPreloads.has(num)) return false;
+        const domImg = verticalImgMap.get(num);
+        if (domImg) return domImg.dataset.hydrated !== '1';
+        return !retainedPreloads.has(num);
+      });
+      if (!nextNum) break;
+      inFlightPreloads.add(nextNum);
+      preloadSinglePage(nextNum).finally(() => {
+        inFlightPreloads.delete(nextNum);
+        pumpPreloadQueue();
+      });
     }
+  }
+
+  function scheduleSlidingPreload(pageNum) {
+    // Hydrate active page immediately if vertical
+    const curImg = verticalImgMap.get(pageNum);
+    const curPageObj = pages[pageNum - 1];
+    if (curImg && curPageObj && curImg.dataset.hydrated !== '1') {
+      hydratePageImg(curImg, curPageObj, book.media_id, 'high');
+    }
+
+    // Evict decoded off-screen cache far from sliding window to keep mobile RAM lean
+    for (const key of retainedPreloads.keys()) {
+      if (key < pageNum - 5 || key > pageNum + 6) {
+        retainedPreloads.delete(key);
+      }
+    }
+
+    preloadPriorityList = computePreloadOrder(pageNum, totalPages, 4, 3);
+    pumpPreloadQueue();
+  }
+
+  let pendingCoverFly =
+    heroTransition?.type === 'to-reader' && heroTransition.imgSrc && heroTransition.fromRect
+      ? heroTransition
+      : null;
+
+  function maybeFlyCoverIntoPage(targetImgEl) {
+    if (!pendingCoverFly || !targetImgEl) return;
+    const fly = pendingCoverFly;
+    pendingCoverFly = null;
+    const cancelFly = runHeroFlyTransition({
+      imgSrc: fly.imgSrc,
+      fromRect: fly.fromRect,
+      toEl: targetImgEl,
+      fromRadius: fly.borderRadius || '16px',
+      toRadius: '0px',
+      duration: 380,
+      objectFit: 'contain',
+    });
+    cleanups.push(cancelFly);
   }
 
   function renderStage() {
     observer?.disconnect();
     observer = null;
+    verticalImgMap.clear();
     revokeObjectUrls(stage);
     stage.replaceChildren();
     setZoom(1);
@@ -441,15 +579,20 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
     if (mode === 'vertical') {
       const list = el('div', { className: 'reader-vertical-list' });
+      let flyTargetImg = null;
       pages.forEach((p, idx) => {
         const pageNum = idx + 1;
-        const priority = Math.abs(pageNum - currentPage) <= 1 ? 'high' : 'lazy';
+        const isCurrent = pageNum === currentPage;
+        const useCoverPreview = Boolean(pendingCoverFly && isCurrent && pageNum === 1);
+        const img = createPageImg(p, book.media_id, {
+          priority: isCurrent ? 'high' : 'auto',
+          deferLoad: !isCurrent,
+          previewCoverUrl: useCoverPreview ? pendingCoverFly.imgSrc : '',
+        });
+        verticalImgMap.set(pageNum, img);
+        if (useCoverPreview) flyTargetImg = img;
         list.appendChild(
-          el(
-            'figure',
-            { className: 'reader-page-frame', dataset: { page: pageNum } },
-            createPageImg(p, book.media_id, priority)
-          )
+          el('figure', { className: 'reader-page-frame', dataset: { page: pageNum } }, img)
         );
       });
       stage.appendChild(list);
@@ -457,6 +600,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       requestAnimationFrame(() => {
         const targetEl = list.querySelector(`[data-page="${currentPage}"]`);
         if (targetEl) viewport.scrollTop = targetEl.offsetTop;
+        if (flyTargetImg) maybeFlyCoverIntoPage(flyTargetImg);
       });
 
       observer = new IntersectionObserver(
@@ -484,11 +628,22 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     revokeObjectUrls(stage);
     const p = pages[currentPage - 1];
     if (!p) return;
-    const animClass =
-      direction > 0 ? 'page-fly-next' : direction < 0 ? 'page-fly-prev' : 'page-fly-in';
+    const useCoverFly = Boolean(pendingCoverFly && direction === 0 && currentPage === 1);
+    const animClass = useCoverFly
+      ? ''
+      : direction > 0
+        ? 'page-fly-next'
+        : direction < 0
+          ? 'page-fly-prev'
+          : 'page-fly-in';
+    const img = createPageImg(p, book.media_id, {
+      priority: 'high',
+      previewCoverUrl: useCoverFly ? pendingCoverFly.imgSrc : '',
+    });
     stage.replaceChildren(
-      el('div', { className: `reader-horizontal-frame ${animClass}` }, createPageImg(p, book.media_id, 'high'))
+      el('div', { className: `reader-horizontal-frame ${animClass}`.trim() }, img)
     );
+    if (useCoverFly) maybeFlyCoverIntoPage(img);
   }
 
   function goToPage(targetPage) {
@@ -592,6 +747,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   let prevTapX = 0;
   let prevTapY = 0;
   let hudBeforeFirstTap = false;
+  let startedAtLeftEdge = false;
 
   function touchDist(t1, t2) {
     return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
@@ -604,7 +760,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       now - prevTapTime < 280 &&
       Math.hypot(clientX - prevTapX, clientY - prevTapY) < 42
     ) {
-      prevTapTime = 0;
+      prevTapTime = -1000;
       setHudVisible(hudBeforeFirstTap);
       setZoom(zoom > 1.1 ? 1 : 2);
       return;
@@ -633,8 +789,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   }
 
   function onTouchStart(e) {
+    if (!e.touches) return;
     if (e.touches.length >= 2) {
       wasMultiTouch = true;
+      startedAtLeftEdge = false;
       pinchStartDist = touchDist(e.touches[0], e.touches[1]);
       pinchStartZoom = zoom;
       touchMoved = true;
@@ -645,6 +803,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       wasMultiTouch = false;
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
+      startedAtLeftEdge = touchStartX <= 24;
       touchStartTime = performance.now();
       touchStartPanX = panX;
       touchStartPanY = panY;
@@ -656,6 +815,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   }
 
   function onTouchMove(e) {
+    if (!e.touches) return;
     if (e.touches.length === 2 && pinchStartDist > 0) {
       e.preventDefault();
       const ratio = touchDist(e.touches[0], e.touches[1]) / pinchStartDist;
@@ -666,6 +826,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       const dx = e.touches[0].clientX - touchStartX;
       const dy = e.touches[0].clientY - touchStartY;
       if (Math.hypot(dx, dy) > 12) touchMoved = true;
+
+      // Let global left-edge swipe-back handle iPhone edge gestures cleanly
+      if (startedAtLeftEdge && dx > 10) return;
 
       if (zoom > 1) {
         e.preventDefault();
@@ -695,9 +858,13 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   }
 
   function onTouchEnd(e) {
+    if (!e.touches || !e.changedTouches) return;
     lastTouchEndTime = performance.now();
     if (e.touches.length < 2) pinchStartDist = 0;
     if (e.changedTouches.length !== 1 || e.touches.length > 0) return;
+    const wasLeftEdge = startedAtLeftEdge;
+    startedAtLeftEdge = false;
+    if (wasLeftEdge && e.changedTouches[0].clientX - touchStartX > 24) return;
 
     if (horizDragging && mode === 'horizontal' && zoom <= 1) {
       horizDragging = false;
