@@ -79,7 +79,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   let theme = prefs.theme; // 'black' | 'charcoal' | 'sepia' | 'white'
   let autoScrollSpeed = prefs.autoScrollSpeed;
   let autoScrolling = false;
-  let hudVisible = true;
+  let hudVisible = false;
   let zoom = 1;
   let panX = 0;
   let panY = 0;
@@ -93,7 +93,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   let observer = null;
 
   const root = el('div', {
-    className: 'reader-shell',
+    className: 'reader-shell hud-hidden',
     dataset: { readerTheme: theme, mode },
   });
   container.replaceChildren(root);
@@ -159,18 +159,28 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   currentPage = Math.min(totalPages, Math.max(1, currentPage));
   const titleText = getBookTitle(book);
 
-  // Build UI elements
-  const pageCounterText = el('span', { className: 'reader-counter' }, `Trang ${currentPage} / ${totalPages}`);
-  const modeToggleBtn = el(
+  // Build minimal, non-intrusive HUD (hidden by default; single-row liquid glass capsules when tapped)
+  const pageCounterText = el('span', { className: 'reader-counter' }, `${currentPage} / ${totalPages}`);
+  const floatingPagePill = el(
     'button',
     {
       type: 'button',
-      className: 'icon-btn reader-hud-btn',
-      'aria-label': 'Đổi chế độ đọc ngang hoặc dọc',
-      title: 'Đổi chế độ đọc',
-      onClick: () => setMode(mode === 'vertical' ? 'horizontal' : 'vertical'),
+      className: 'reader-mini-pill glass-clear tabular-nums',
+      'aria-label': 'Hiện thanh điều khiển đọc truyện',
+      onClick: () => setHudVisible(true),
     },
-    svgIcon(mode === 'vertical' ? 'vertical' : 'horizontal', 20)
+    `${currentPage} / ${totalPages}`
+  );
+
+  const zoomResetBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'pill-btn seg-btn',
+      'aria-label': 'Đặt lại mức thu phóng 100%',
+      onClick: () => setZoom(1),
+    },
+    '100%'
   );
 
   const settingsDialog = buildSettingsDialog();
@@ -183,11 +193,11 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       'button',
       {
         type: 'button',
-        className: 'icon-btn reader-hud-btn',
+        className: 'icon-btn reader-hud-btn compact',
         'aria-label': 'Quay lại chi tiết truyện',
         onClick: () => navigate(`/manga/${id}`),
       },
-      svgIcon('back', 20)
+      svgIcon('back', 18)
     ),
     el(
       'div',
@@ -196,19 +206,14 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       pageCounterText
     ),
     el(
-      'div',
-      { className: 'reader-top-actions' },
-      modeToggleBtn,
-      el(
-        'button',
-        {
-          type: 'button',
-          className: 'icon-btn reader-hud-btn',
-          'aria-label': 'Cài đặt đọc truyện',
-          onClick: () => settingsDialog.showModal(),
-        },
-        svgIcon('settings', 20)
-      )
+      'button',
+      {
+        type: 'button',
+        className: 'icon-btn reader-hud-btn compact',
+        'aria-label': 'Tùy chọn đọc truyện',
+        onClick: () => settingsDialog.showModal(),
+      },
+      svgIcon('settings', 18)
     )
   );
 
@@ -226,45 +231,35 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     'button',
     {
       type: 'button',
-      className: 'pill-btn reader-hud-chip',
+      className: 'icon-btn reader-hud-btn compact',
+      'aria-label': 'Bật hoặc tắt tự động cuộn',
       'aria-pressed': 'false',
+      title: 'Tự động cuộn (Space)',
       onClick: () => setAutoScrolling(!autoScrolling),
     },
-    svgIcon('play', 16),
-    el('span', {}, 'Tự cuộn')
-  );
-
-  const zoomResetBtn = el(
-    'button',
-    {
-      type: 'button',
-      className: 'pill-btn reader-hud-chip',
-      'aria-label': 'Đặt lại mức thu phóng 100%',
-      onClick: () => setZoom(1),
-    },
-    '100%'
+    svgIcon('play', 17)
   );
 
   const prevPageBtn = el(
     'button',
     {
       type: 'button',
-      className: 'icon-btn reader-hud-btn',
+      className: 'icon-btn reader-hud-btn compact',
       'aria-label': 'Trang trước',
       onClick: () => goToPage(currentPage - 1),
     },
-    svgIcon('chevronLeft', 20)
+    svgIcon('chevronLeft', 18)
   );
 
   const nextPageBtn = el(
     'button',
     {
       type: 'button',
-      className: 'icon-btn reader-hud-btn',
+      className: 'icon-btn reader-hud-btn compact',
       'aria-label': 'Trang tiếp theo',
       onClick: () => goToPage(currentPage + 1),
     },
-    svgIcon('chevronRight', 20)
+    svgIcon('chevronRight', 18)
   );
 
   const bottomBar = el(
@@ -275,37 +270,8 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       { className: 'reader-scrubber-row' },
       prevPageBtn,
       pageSlider,
-      nextPageBtn
-    ),
-    el(
-      'div',
-      { className: 'reader-tools-row' },
-      autoScrollBtn,
-      el(
-        'div',
-        { className: 'reader-zoom-group' },
-        el(
-          'button',
-          {
-            type: 'button',
-            className: 'icon-btn reader-hud-btn compact',
-            'aria-label': 'Thu nhỏ',
-            onClick: () => setZoom(zoom - 0.25),
-          },
-          svgIcon('zoomOut', 18)
-        ),
-        zoomResetBtn,
-        el(
-          'button',
-          {
-            type: 'button',
-            className: 'icon-btn reader-hud-btn compact',
-            'aria-label': 'Phóng to',
-            onClick: () => setZoom(zoom + 0.25),
-          },
-          svgIcon('zoomIn', 18)
-        )
-      )
+      nextPageBtn,
+      autoScrollBtn
     )
   );
 
@@ -318,7 +284,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   const stage = el('div', { className: 'reader-stage' });
   viewport.appendChild(stage);
 
-  root.replaceChildren(topBar, viewport, bottomBar, settingsDialog);
+  root.replaceChildren(topBar, viewport, floatingPagePill, bottomBar, settingsDialog);
 
   function buildSettingsDialog() {
     const modeButtons = [
@@ -424,6 +390,38 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         el(
           'div',
           { className: 'setting-group' },
+          el('span', { className: 'setting-label' }, 'Thu phóng ảnh'),
+          el(
+            'div',
+            { className: 'segmented-row' },
+            el(
+              'button',
+              {
+                type: 'button',
+                className: 'pill-btn seg-btn',
+                'aria-label': 'Thu nhỏ',
+                onClick: () => setZoom(zoom - 0.25),
+              },
+              svgIcon('zoomOut', 16),
+              'Thu nhỏ'
+            ),
+            zoomResetBtn,
+            el(
+              'button',
+              {
+                type: 'button',
+                className: 'pill-btn seg-btn',
+                'aria-label': 'Phóng to',
+                onClick: () => setZoom(zoom + 0.25),
+              },
+              svgIcon('zoomIn', 16),
+              'Phóng to'
+            )
+          )
+        ),
+        el(
+          'div',
+          { className: 'setting-group' },
           el(
             'div',
             { className: 'setting-label-row' },
@@ -435,7 +433,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         el(
           'p',
           { className: 'setting-hint' },
-          'Mẹo: Chạm giữa màn hình để ẩn/hiện thanh công cụ • Nhấp đúp hoặc chụm 2 ngón để phóng to • Phím ←/→ để chuyển trang trên PC.'
+          'Chạm giữa màn hình hoặc góc số trang để mở/ẩn thanh điều khiển • Chụm 2 ngón hoặc nhấp đúp để phóng to • Phím ←/→ lật trang.'
         )
       )
     );
@@ -453,6 +451,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
   function setHudVisible(visible) {
     hudVisible = visible;
+    if (visible && viewport) lastHudScrollTop = viewport.scrollTop;
     root.classList.toggle('hud-hidden', !hudVisible);
   }
 
@@ -484,7 +483,8 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   function persistCurrentPage(pageNum) {
     const clamped = Math.min(totalPages, Math.max(1, pageNum));
     currentPage = clamped;
-    pageCounterText.textContent = `Trang ${currentPage} / ${totalPages}`;
+    pageCounterText.textContent = `${currentPage} / ${totalPages}`;
+    floatingPagePill.textContent = `${currentPage} / ${totalPages}`;
     pageSlider.value = String(currentPage);
     prevPageBtn.disabled = currentPage <= 1;
     nextPageBtn.disabled = currentPage >= totalPages;
@@ -518,8 +518,6 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     stage.replaceChildren();
     setZoom(1);
     root.dataset.mode = mode;
-
-    modeToggleBtn.replaceChildren(svgIcon(mode === 'vertical' ? 'vertical' : 'horizontal', 20));
     syncSettingsDialogUI();
 
     if (mode === 'vertical') {
@@ -530,8 +528,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         const fig = el(
           'figure',
           { className: 'reader-page-frame', dataset: { page: pageNum } },
-          createPageImg(p, book.media_id, priority),
-          el('figcaption', { className: 'reader-page-badge' }, `${pageNum} / ${totalPages}`)
+          createPageImg(p, book.media_id, priority)
         );
         list.appendChild(fig);
       });
@@ -647,12 +644,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     stopAutoScrollLoops();
     autoScrollBtn.setAttribute('aria-pressed', String(autoScrolling));
     autoScrollBtn.classList.toggle('active', autoScrolling);
-    autoScrollBtn.replaceChildren(
-      svgIcon(autoScrolling ? 'pause' : 'play', 16),
-      el('span', {}, autoScrolling ? 'Dừng cuộn' : 'Tự cuộn')
-    );
+    autoScrollBtn.replaceChildren(svgIcon(autoScrolling ? 'pause' : 'play', 17));
 
     if (!autoScrolling) return;
+    setHudVisible(false);
     if (mode === 'vertical') {
       lastFrameTs = 0;
       rafId = requestAnimationFrame(verticalAutoStep);
@@ -788,15 +783,29 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     if (mode === 'horizontal' && zoom <= 1) {
       const ratio = clientX / Math.max(1, viewport.clientWidth);
       if (ratio < 0.25) {
+        if (hudVisible) setHudVisible(false);
         goToPage(currentPage - 1);
         return;
       }
       if (ratio > 0.75) {
+        if (hudVisible) setHudVisible(false);
         goToPage(currentPage + 1);
         return;
       }
     }
     setHudVisible(!hudVisible);
+  }
+
+  // Auto-hide HUD the instant user scrolls in vertical reading mode so controls never get in the way
+  let lastHudScrollTop = 0;
+  function onViewportScroll() {
+    if (!hudVisible || mode !== 'vertical') {
+      lastHudScrollTop = viewport.scrollTop;
+      return;
+    }
+    if (Math.abs(viewport.scrollTop - lastHudScrollTop) > 28) {
+      setHudVisible(false);
+    }
   }
 
   // Desktop mouse interactions: click, double-click zoom, Ctrl+wheel zoom
@@ -849,6 +858,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     }
   }
 
+  viewport.addEventListener('scroll', onViewportScroll, { passive: true });
   viewport.addEventListener('touchstart', onTouchStart, { passive: true });
   viewport.addEventListener('touchmove', onTouchMove, { passive: false });
   viewport.addEventListener('touchend', onTouchEnd, { passive: true });
@@ -861,6 +871,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     clearTimeout(tapTimer);
     clearTimeout(clickDelayTimer);
     observer?.disconnect();
+    viewport.removeEventListener('scroll', onViewportScroll);
     viewport.removeEventListener('touchstart', onTouchStart);
     viewport.removeEventListener('touchmove', onTouchMove);
     viewport.removeEventListener('touchend', onTouchEnd);
