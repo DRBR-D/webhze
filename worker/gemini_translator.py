@@ -15,6 +15,11 @@ try:
 except Exception:
     GoogleTranslator = None
 
+DEFAULT_DEEPSEEK_MODELS = [
+    "deepseek-flash",
+    "deepseek-v4-pro",
+]
+
 DEFAULT_MODEL_CASCADE = [
     "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
@@ -69,24 +74,31 @@ class GeminiMangaTranslator:
         api_key: str | None = None,
         primary_model: str | None = None,
         timeout_sec: int = 10,
+        deepseek_api_key: str | None = None,
+        deepseek_base_url: str | None = None,
     ):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
-        primary = (primary_model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
-        self.models = [primary] + [m for m in DEFAULT_MODEL_CASCADE if m != primary]
+        self.deepseek_api_key = (deepseek_api_key or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        self.deepseek_base_url = (deepseek_base_url or os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+
+        gemini_primary = (primary_model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+        gemini_models = [gemini_primary] + [m for m in DEFAULT_MODEL_CASCADE if m != gemini_primary]
+
+        if self.deepseek_api_key:
+            ds_primary = (os.getenv("DEEPSEEK_MODEL") or "deepseek-flash").strip()
+            ds_models = [ds_primary] + [m for m in DEFAULT_DEEPSEEK_MODELS if m != ds_primary]
+            self.models = ds_models + (gemini_models if self.api_key else [])
+        else:
+            self.models = gemini_models
+
         self.timeout_sec = timeout_sec
         self.session = requests.Session()
         self._cooldown_until: dict[str, float] = {}
 
-    def _call_gemini(self, model: str, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str]:
-        if not self.api_key:
-            return None, "no_api_key"
-        now = time.time()
-        if self._cooldown_until.get(model, 0) > now:
-            return None, "cooldown"
-
+    def _build_prompt(self, lines: Sequence[str], source_lang: str, target_lang: str) -> str:
         lang_desc = LANG_NAMES.get(source_lang, source_lang)
         target_name = "Vietnamese" if target_lang == "vi" else target_lang
-        prompt = (
+        return (
             f"You are an expert manga/comic translator translating dialogue from {lang_desc} into natural, "
             f"idiomatic {target_name}.\n"
             "Rules:\n"
@@ -96,6 +108,65 @@ class GeminiMangaTranslator:
             f"- Return ONLY a valid JSON array of exactly {len(lines)} strings in the same order, with no commentary.\n\n"
             f"Input JSON array:\n{json.dumps(list(lines), ensure_ascii=False)}"
         )
+
+    def _call_deepseek(self, model: str, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str]:
+        if not self.deepseek_api_key:
+            return None, "no_api_key"
+        if self._cooldown_until.get(model, 0) > time.time():
+            return None, "cooldown"
+
+        url = f"{self.deepseek_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": self._build_prompt(lines, source_lang, target_lang)}],
+            "temperature": 0.25,
+            "max_tokens": max(1024, len(lines) * 160),
+        }
+
+        try:
+            resp = self.session.post(url, headers=headers, json=payload, timeout=max(self.timeout_sec, 20))
+        except requests.RequestException as exc:
+            self._cooldown_until[model] = time.time() + 120
+            return None, f"net_err:{exc.__class__.__name__}"
+
+        if resp.status_code in (402, 429, 503):
+            self._cooldown_until[model] = time.time() + 180
+            return None, f"http_{resp.status_code}"
+        if resp.status_code >= 400:
+            return None, f"http_{resp.status_code}"
+
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return None, "no_choices"
+        choice = choices[0]
+        if choice.get("finish_reason") == "content_filter":
+            return None, "blocked:content_filter"
+
+        raw_text = choice.get("message", {}).get("content") or ""
+        parsed = _extract_json_array(raw_text)
+        if not parsed or len(parsed) != len(lines):
+            return None, "parse_mismatch"
+
+        return parsed, "ok"
+
+    def _call_model(self, model: str, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str]:
+        if model.startswith("deepseek-"):
+            return self._call_deepseek(model, lines, source_lang, target_lang)
+        return self._call_gemini(model, lines, source_lang, target_lang)
+
+    def _call_gemini(self, model: str, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str]:
+        if not self.api_key:
+            return None, "no_api_key"
+        now = time.time()
+        if self._cooldown_until.get(model, 0) > now:
+            return None, "cooldown"
+
+        prompt = self._build_prompt(lines, source_lang, target_lang)
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
         gen_cfg: dict = {
@@ -171,18 +242,18 @@ class GeminiMangaTranslator:
         if not lines:
             return [], {"model": "none", "fallbackCount": 0}
 
-        # Tier 1: Whole-page contextual pass across Gemini 4 -> 3.5 -> 3.8 -> 2.5 -> Gemma 4
+        # Tier 1: Whole-page contextual pass across DeepSeek V4.1 -> Gemini cascade
         was_blocked = False
         for model in self.models:
-            translated, status = self._call_gemini(model, lines, source_lang, target_lang)
+            translated, status = self._call_model(model, lines, source_lang, target_lang)
             if translated is not None:
                 return translated, {"model": model, "fallbackCount": 0}
             if status != "cooldown":
-                print(f"[Gemini] {model} -> {status}", flush=True)
+                print(f"[LLM] {model} -> {status}", flush=True)
             if status.startswith("blocked:"):
                 was_blocked = True
 
-        # Tier 2: If whole page was blocked by 1-2 sensitive lines, retry per-line on fast Gemini
+        # Tier 2: If whole page was blocked by 1-2 sensitive lines, retry per-line on fast models
         # and automatically drop only the blocked lines onto the unfiltered fallback translator.
         results: list[str] = []
         fallback_count = 0
@@ -193,7 +264,7 @@ class GeminiMangaTranslator:
             translated_line = None
             if was_blocked and fast_models:
                 for m in fast_models:
-                    res, st = self._call_gemini(m, [line], source_lang, target_lang)
+                    res, st = self._call_model(m, [line], source_lang, target_lang)
                     if res:
                         translated_line = res[0]
                         used_model = m

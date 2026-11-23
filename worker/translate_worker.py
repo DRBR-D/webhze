@@ -111,7 +111,7 @@ def run_worker_loop() -> None:
     print(f"=== MANGA GPU TRANSLATION WORKER ===", flush=True)
     print(f"Server : {server_url}", flush=True)
     print(f"Device : {gpu_name} | Inpaint <= {pipeline.inpainter.max_size}px | Pipelined x2", flush=True)
-    print(f"Gemini : {' -> '.join(translator.models)}", flush=True)
+    print(f"Models : {' -> '.join(translator.models)}", flush=True)
     print(f"Font   : {pipeline.font_path or 'default'}", flush=True)
 
     # Pre-load LaMa onto RTX 3050 CUDA now so Page 1 starts immediately with 0 cold-start lag
