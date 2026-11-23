@@ -12,6 +12,7 @@ import pathlib
 import socket
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -109,11 +110,15 @@ def run_worker_loop() -> None:
 
     print(f"=== MANGA GPU TRANSLATION WORKER ===", flush=True)
     print(f"Server : {server_url}", flush=True)
-    print(f"Device : {gpu_name} | Inpaint <= {pipeline.inpainter.max_size}px", flush=True)
+    print(f"Device : {gpu_name} | Inpaint <= {pipeline.inpainter.max_size}px | Pipelined x2", flush=True)
     print(f"Gemini : {' -> '.join(translator.models)}", flush=True)
     print(f"Font   : {pipeline.font_path or 'default'}", flush=True)
 
-    http_sess = requests.Session()
+    # Pre-load LaMa onto RTX 3050 CUDA now so Page 1 starts immediately with 0 cold-start lag
+    pipeline.warmup()
+
+    stream_sess = requests.Session()
+    job_pool = ThreadPoolExecutor(max_workers=2)
     backoff = 2.0
 
     while True:
@@ -127,7 +132,7 @@ def run_worker_loop() -> None:
         }
         try:
             print(f"[Connect] Đang nối tới {stream_url} ...", flush=True)
-            with http_sess.get(stream_url, headers=headers, stream=True, timeout=(12, 45)) as resp:
+            with stream_sess.get(stream_url, headers=headers, stream=True, timeout=(12, 45)) as resp:
                 if resp.status_code == 401:
                     print("[ERROR] WORKER_TOKEN bị từ chối (401). Kiểm tra lại token trên Render và worker/.env!", flush=True)
                     time.sleep(10)
@@ -148,7 +153,7 @@ def run_worker_loop() -> None:
                             payload_str = "\n".join(data_lines)
                             try:
                                 job = json.loads(payload_str)
-                                handle_job(http_sess, server_url, token, pipeline, job)
+                                job_pool.submit(handle_job, server_url, token, pipeline, job)
                             except Exception as exc:
                                 print(f"[Job Error] {exc}", flush=True)
                         event_name = None
@@ -162,6 +167,7 @@ def run_worker_loop() -> None:
                         data_lines.append(line[5:].strip())
         except KeyboardInterrupt:
             print("\n[Stop] Đã tắt worker dịch truyện.", flush=True)
+            job_pool.shutdown(wait=False)
             break
         except Exception as exc:
             print(f"[Reconnect] Mất kết nối ({exc}). Thử nối lại sau {backoff:.0f}s...", flush=True)
@@ -170,12 +176,12 @@ def run_worker_loop() -> None:
 
 
 def handle_job(
-    session: requests.Session,
     server_url: str,
     token: str,
     pipeline: MangaTranslationPipeline,
     job: dict,
 ) -> None:
+    session = requests.Session()
     job_id = job["jobId"]
     book_id = job.get("bookId")
     page = job.get("page")

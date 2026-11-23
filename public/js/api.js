@@ -328,7 +328,7 @@ export async function translateSinglePage(
  */
 export async function translateBookPages(
   book,
-  { sourceLang = null, targetLang = 'vi', force = false, signal, onProgress } = {}
+  { sourceLang = null, targetLang = 'vi', force = false, signal, onProgress, concurrency = 2 } = {}
 ) {
   const pages = book?.pages || [];
   if (!pages.length) throw new Error('Truyện chưa có dữ liệu trang để dịch.');
@@ -338,28 +338,36 @@ export async function translateBookPages(
   const readingDir = detected.readingDir;
   const cache = 'caches' in window ? await caches.open(TRANSLATED_CACHE_NAME) : null;
   let done = 0;
+  let cursor = 0;
   const total = pages.length;
 
-  for (const p of pages) {
-    if (signal?.aborted) throw new DOMException('Đã hủy dịch truyện', 'AbortError');
-    if (!force && cache) {
-      const hit = await cache.match(translatedCacheKey(book.id, p.number, targetLang));
-      if (hit) {
-        done++;
-        onProgress?.(done, total, { cached: true, page: p.number });
-        continue;
+  // Pipelined 2-slot worker queue: overlaps page N+1 download/OCR/Gemini while GPU finishes page N
+  async function slotWorker() {
+    while (cursor < total) {
+      if (signal?.aborted) throw new DOMException('Đã hủy dịch truyện', 'AbortError');
+      const p = pages[cursor++];
+      if (!force && cache) {
+        const hit = await cache.match(translatedCacheKey(book.id, p.number, targetLang));
+        if (hit) {
+          done++;
+          onProgress?.(done, total, { cached: true, page: p.number });
+          continue;
+        }
       }
+      const res = await translateSinglePage(book, p, {
+        sourceLang: lang,
+        readingDir,
+        targetLang,
+        force,
+        signal,
+      });
+      URL.revokeObjectURL(res.objectUrl);
+      done++;
+      onProgress?.(done, total, { ...res.meta, page: p.number });
     }
-    const res = await translateSinglePage(book, p, {
-      sourceLang: lang,
-      readingDir,
-      targetLang,
-      force,
-      signal,
-    });
-    URL.revokeObjectURL(res.objectUrl);
-    done++;
-    onProgress?.(done, total, { ...res.meta, page: p.number });
   }
+
+  const slots = Math.min(Math.max(1, concurrency), total);
+  await Promise.all(Array.from({ length: slots }, () => slotWorker()));
   return { done, total };
 }

@@ -1567,9 +1567,12 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
   // --- Pre-Read AI Translation Panel ("khi chưa vô truyện nhấn nút dịch, xong mới vô coi") ---
   let translateAbort = null;
   let translating = false;
+  let keepTranslatingOnLeave = false;
   let workerStatus = { online: false, worker: null };
   let translatedStats = { done: 0, total: book.pages?.length || 0 };
-  cleanups.push(() => translateAbort?.abort());
+  cleanups.push(() => {
+    if (!keepTranslatingOnLeave) translateAbort?.abort();
+  });
 
   const detectedLang = detectBookLanguage(book);
   const langSelect = el(
@@ -1636,7 +1639,27 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
 
     if (translating) {
       translateProgressWrap.hidden = false;
-      translateActionsRow.replaceChildren(
+      const busyBtns = [];
+      if (translatedStats.done >= 3 && translatedStats.done < translatedStats.total) {
+        busyBtns.push(
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'btn translate-read-vi-btn',
+              onClick: () => {
+                // Keep translating remaining pages in background? Stop aborting on leave if user jumps in early
+                keepTranslatingOnLeave = true;
+                const startPage = Math.max(1, lastReadPage || 1);
+                openBookReader(book, startPage, startPage === 1 ? coverBox : null, { langMode: 'vi' });
+              },
+            },
+            svgIcon('play', 16),
+            `Đọc trước (${translatedStats.done} trang xong)`
+          )
+        );
+      }
+      busyBtns.push(
         el(
           'button',
           {
@@ -1648,6 +1671,7 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
           'Hủy dịch'
         )
       );
+      translateActionsRow.replaceChildren(...busyBtns);
       return;
     }
 
@@ -1752,10 +1776,11 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
     }
 
     translating = true;
+    keepTranslatingOnLeave = false;
     translateAbort = new AbortController();
     const total = book.pages.length;
     translateBarFill.style.width = '4%';
-    translateProgressText.textContent = `Đang gửi trang 1 / ${total} xuống Laptop GPU...`;
+    translateProgressText.textContent = `Đang gửi trang 1–2 / ${total} xuống Laptop GPU...`;
     renderTranslateActions();
 
     try {
@@ -1771,11 +1796,16 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
           translateBarFill.style.width = `${pct}%`;
           const modelNote = metaInfo?.model ? ` · ${metaInfo.model}` : '';
           translateProgressText.textContent = `Đã dịch ${done} / ${tot} trang (${pct}%)${modelNote}`;
+          if (done >= 3 && done < tot && !keepTranslatingOnLeave) renderTranslateActions();
         },
       });
       translating = false;
       translateAbort = null;
       translatedStats = await countTranslatedPages(book, 'vi');
+      if (keepTranslatingOnLeave) {
+        showToast(`Đã dịch xong toàn bộ ${translatedStats.done}/${translatedStats.total} trang!`, 'success');
+        return;
+      }
       renderTranslateActions();
       showToast(`Dịch xong ${translatedStats.done}/${translatedStats.total} trang! Đang mở bản Tiếng Việt...`, 'success');
       // Auto-open Reader in Vietnamese once translation finishes!

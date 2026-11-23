@@ -13,7 +13,9 @@ import io
 import math
 import os
 import pathlib
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cv2
@@ -410,10 +412,18 @@ class MangaTranslationPipeline:
         self.font_path = _pick_vietnamese_font()
         self.inpainter = LamaInpainter(
             device=os.getenv("DEVICE", "cuda"),
-            max_size=int(os.getenv("INPAINT_MAX_SIZE", "1024")),
+            max_size=int(os.getenv("INPAINT_MAX_SIZE", "768")),
         )
         # Keep at most 2 OCR engines loaded to stay lightweight on 8GB RAM
         self._ocr_cache: dict[str, RapidOCR] = {}
+        self._ocr_lock = threading.Lock()
+        self._gpu_lock = threading.Lock()
+        self._stage_pool = ThreadPoolExecutor(max_workers=4)
+
+    def warmup(self) -> None:
+        """Pre-load LaMa onto CUDA at worker startup so Page 1 has zero cold-start delay."""
+        with self._gpu_lock:
+            self.inpainter._load()
 
     def _get_ocr(self, source_lang: str) -> RapidOCR:
         key = source_lang if source_lang in ("ja", "en", "zh", "ko") else "auto"
@@ -438,9 +448,10 @@ class MangaTranslationPipeline:
         rgb = np.array(pil_in)
         h, w = rgb.shape[:2]
 
-        ocr = self._get_ocr(source_lang)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        out = ocr(bgr)
+        with self._ocr_lock:
+            ocr = self._get_ocr(source_lang)
+            out = ocr(bgr)
 
         raw_boxes: list[TextBox] = []
         if out and out.boxes is not None and out.txts is not None:
@@ -461,7 +472,7 @@ class MangaTranslationPipeline:
         if not clusters:
             # No text detected on artwork/cover page: return clean WebP unchanged
             buf = io.BytesIO()
-            pil_in.save(buf, format="WEBP", quality=86)
+            pil_in.save(buf, format="WEBP", quality=84, method=1)
             return buf.getvalue(), {
                 "bubbles": 0,
                 "model": "no_text",
@@ -469,15 +480,7 @@ class MangaTranslationPipeline:
                 "ms": int((time.perf_counter() - t0) * 1000),
             }
 
-        # 1. Contextual whole-page translation via Gemini 4 / 3.x + unfiltered fallback
-        source_lines = [c.text for c in clusters]
-        translated_lines, trans_meta = self.translator.translate_page_lines(
-            source_lines, source_lang=source_lang, target_lang=target_lang
-        )
-        for c, tr in zip(clusters, translated_lines):
-            c.translated = tr
-
-        # 2. Build tight dilated polygon mask over detected text & erase with LaMa CUDA FP16
+        # Build text mask immediately so LaMa GPU inpainting & Gemini API run IN PARALLEL!
         mask = np.zeros((h, w), dtype=np.uint8)
         for box in raw_boxes:
             cv2.fillPoly(mask, [box.polygon.astype(np.int32)], 255)
@@ -485,12 +488,26 @@ class MangaTranslationPipeline:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
         mask = cv2.dilate(mask, kernel, iterations=1)
 
-        cleaned_rgb = self.inpainter.inpaint(rgb, mask)
+        source_lines = [c.text for c in clusters]
 
-        # 3. Render Vietnamese dialogue cleanly into the cleaned speech bubbles
+        def _run_gpu_inpaint() -> np.ndarray:
+            with self._gpu_lock:
+                return self.inpainter.inpaint(rgb, mask)
+
+        # Overlap RTX 3050 LaMa (~0.78s) with Gemini API network call (~1.3s) -> 0s extra GPU wait!
+        inpaint_fut = self._stage_pool.submit(_run_gpu_inpaint)
+        translated_lines, trans_meta = self.translator.translate_page_lines(
+            source_lines, source_lang=source_lang, target_lang=target_lang
+        )
+        cleaned_rgb = inpaint_fut.result()
+
+        for c, tr in zip(clusters, translated_lines):
+            c.translated = tr
+
+        # Render Vietnamese dialogue cleanly into the cleaned speech bubbles
         out_img = render_vietnamese_bubbles(cleaned_rgb, clusters, self.font_path)
         buf = io.BytesIO()
-        out_img.save(buf, format="WEBP", quality=85, method=4)
+        out_img.save(buf, format="WEBP", quality=82, method=1)
 
         return buf.getvalue(), {
             "bubbles": len(clusters),

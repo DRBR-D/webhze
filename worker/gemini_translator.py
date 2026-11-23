@@ -16,12 +16,11 @@ except Exception:
     GoogleTranslator = None
 
 DEFAULT_MODEL_CASCADE = [
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-flash-latest",
     "gemma-4-31b-it",
 ]
 
@@ -69,10 +68,10 @@ class GeminiMangaTranslator:
         self,
         api_key: str | None = None,
         primary_model: str | None = None,
-        timeout_sec: int = 14,
+        timeout_sec: int = 10,
     ):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY") or "").strip()
-        primary = (primary_model or os.getenv("GEMINI_MODEL") or "gemini-4-hydrogen").strip()
+        primary = (primary_model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
         self.models = [primary] + [m for m in DEFAULT_MODEL_CASCADE if m != primary]
         self.timeout_sec = timeout_sec
         self.session = requests.Session()
@@ -119,12 +118,12 @@ class GeminiMangaTranslator:
         try:
             resp = self.session.post(url, json=payload, timeout=self.timeout_sec)
         except requests.RequestException as exc:
-            self._cooldown_until[model] = time.time() + 60
+            self._cooldown_until[model] = time.time() + 180
             return None, f"net_err:{exc.__class__.__name__}"
 
         if resp.status_code in (429, 503):
-            # Briefly back off overloaded/rate-limited models so cascade stays fast
-            self._cooldown_until[model] = time.time() + (35 if resp.status_code == 503 else 50)
+            # Back off overloaded/rate-limited models so the whole chapter stays fast
+            self._cooldown_until[model] = time.time() + 180
             return None, f"http_{resp.status_code}"
         if resp.status_code >= 400:
             return None, f"http_{resp.status_code}"
