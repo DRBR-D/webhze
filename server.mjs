@@ -187,7 +187,7 @@ async function serveStatic(res, pathname) {
     'Content-Type': contentType,
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
-    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600',
+    'Cache-Control': ['.html', '.css', '.js', '.mjs'].includes(ext) ? 'no-cache' : 'public, max-age=3600',
   });
   res.end(data);
 }

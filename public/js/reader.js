@@ -14,7 +14,9 @@ import {
 import {
   el,
   svgIcon,
-  wireDialogLightDismiss,
+  wireIosSheet,
+  closeTopLayer,
+  rubberband,
   revokeObjectUrls,
   showToast,
 } from './dom.js';
@@ -172,11 +174,11 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   );
 
   const settingsDialog = buildSettingsDialog();
-  wireDialogLightDismiss(settingsDialog);
+  wireIosSheet(settingsDialog);
 
   const topBar = el(
     'header',
-    { className: 'reader-top-bar' },
+    { className: 'reader-top-bar glass-clear' },
     el(
       'button',
       {
@@ -267,7 +269,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
   const bottomBar = el(
     'footer',
-    { className: 'reader-bottom-bar' },
+    { className: 'reader-bottom-bar glass-clear' },
     el(
       'div',
       { className: 'reader-scrubber-row' },
@@ -345,23 +347,28 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     const dialog = el(
       'dialog',
       {
-        className: 'app-dialog reader-settings-dialog',
+        className: 'app-dialog reader-settings-dialog glass-regular',
         closedby: 'any',
         'aria-labelledby': 'reader-settings-title',
       },
       el(
         'div',
-        { className: 'dialog-header' },
-        el('h2', { id: 'reader-settings-title' }, 'Cài đặt đọc truyện'),
+        { className: 'sheet-drag-zone', dataset: { sheetHandle: '' } },
+        el('span', { className: 'sheet-grabber', 'aria-hidden': 'true' }),
         el(
-          'button',
-          {
-            type: 'button',
-            className: 'icon-btn',
-            'aria-label': 'Đóng cài đặt',
-            onClick: () => dialog.close(),
-          },
-          svgIcon('close', 20)
+          'div',
+          { className: 'dialog-header' },
+          el('h2', { id: 'reader-settings-title' }, 'Tùy chọn đọc'),
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'sheet-done-btn',
+              'aria-label': 'Xong và đóng cài đặt',
+              onClick: () => closeTopLayer(dialog),
+            },
+            'Xong'
+          )
         )
       ),
       el(
@@ -461,9 +468,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       panX = 0;
       panY = 0;
     }
-    stage.style.setProperty('--zoom', String(zoom));
-    stage.style.setProperty('--pan-x', `${panX}px`);
-    stage.style.setProperty('--pan-y', `${panY}px`);
+    stage.style.transition = '';
+    stage.style.transform = zoom > 1
+      ? `translate3d(${panX.toFixed(1)}px, ${panY.toFixed(1)}px, 0) scale(${zoom})`
+      : '';
     viewport.classList.toggle('is-zoomed', zoom > 1);
     zoomResetBtn.textContent = `${Math.round(zoom * 100)}%`;
   }
@@ -653,7 +661,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     }
   }
 
-  // --- Touch Gestures: Pinch-zoom, Pan, Swipe, Double-tap, Single-tap ---
+  // --- Touch Gestures: Pinch-zoom, Pan, 1:1 Horizontal Swipe w/ Rubber-band, Double-tap ---
   let pinchStartDist = 0;
   let pinchStartZoom = 1;
   let touchStartX = 0;
@@ -661,6 +669,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   let touchStartPanX = 0;
   let touchStartPanY = 0;
   let touchMoved = false;
+  let horizDragging = false;
+  let horizDragX = 0;
+  let touchSamples = [];
   let lastTapTime = 0;
   let tapTimer = 0;
 
@@ -673,6 +684,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       pinchStartDist = touchDist(e.touches[0], e.touches[1]);
       pinchStartZoom = zoom;
       touchMoved = true;
+      horizDragging = false;
       return;
     }
     if (e.touches.length === 1) {
@@ -681,6 +693,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       touchStartPanX = panX;
       touchStartPanY = panY;
       touchMoved = false;
+      horizDragging = false;
+      horizDragX = 0;
+      touchSamples = [{ x: touchStartX, t: performance.now() }];
     }
   }
 
@@ -695,6 +710,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       const dx = e.touches[0].clientX - touchStartX;
       const dy = e.touches[0].clientY - touchStartY;
       if (Math.hypot(dx, dy) > 10) touchMoved = true;
+
       if (zoom > 1) {
         e.preventDefault();
         const limitX = (viewport.clientWidth * (zoom - 1)) / 2;
@@ -702,6 +718,20 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         panX = Math.max(-limitX, Math.min(limitX, touchStartPanX + dx));
         panY = Math.max(-limitY, Math.min(limitY, touchStartPanY + dy));
         applyTransform();
+        return;
+      }
+
+      // Direct 1:1 horizontal page tracking with edge rubber-banding
+      if (mode === 'horizontal' && (horizDragging || (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.15))) {
+        e.preventDefault();
+        horizDragging = true;
+        const atStartEdge = currentPage <= 1 && dx > 0;
+        const atEndEdge = currentPage >= totalPages && dx < 0;
+        horizDragX = (atStartEdge || atEndEdge) ? rubberband(dx, viewport.clientWidth * 0.5, 0.45) : dx;
+        stage.style.transition = 'none';
+        stage.style.transform = `translate3d(${horizDragX.toFixed(1)}px, 0, 0)`;
+        touchSamples.push({ x: e.touches[0].clientX, t: performance.now() });
+        if (touchSamples.length > 5) touchSamples.shift();
       }
     }
   }
@@ -710,13 +740,31 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     if (e.touches.length < 2) pinchStartDist = 0;
     if (e.changedTouches.length !== 1 || e.touches.length > 0) return;
 
-    const dx = e.changedTouches[0].clientX - touchStartX;
-    const dy = e.changedTouches[0].clientY - touchStartY;
+    if (horizDragging && mode === 'horizontal' && zoom <= 1) {
+      horizDragging = false;
+      let velocity = 0;
+      if (touchSamples.length >= 2) {
+        const a = touchSamples[0];
+        const b = touchSamples[touchSamples.length - 1];
+        velocity = (b.x - a.x) / Math.max(1, b.t - a.t);
+      }
+      const threshold = Math.max(48, viewport.clientWidth * 0.22);
+      const goNext = (horizDragX < -threshold || velocity < -0.35) && currentPage < totalPages;
+      const goPrev = (horizDragX > threshold || velocity > 0.35) && currentPage > 1;
 
-    // Horizontal swipe to flip pages when not zoomed
-    if (mode === 'horizontal' && zoom <= 1 && Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.3) {
-      if (dx < 0) goToPage(currentPage + 1);
-      else goToPage(currentPage - 1);
+      if (goNext || goPrev) {
+        stage.style.transition = '';
+        stage.style.transform = '';
+        goToPage(goNext ? currentPage + 1 : currentPage - 1);
+      } else {
+        // Spring-like snap back to center
+        stage.style.transition = 'transform 280ms cubic-bezier(0.23, 1, 0.32, 1)';
+        stage.style.transform = 'translate3d(0, 0, 0)';
+        setTimeout(() => {
+          stage.style.transition = '';
+          stage.style.transform = '';
+        }, 280);
+      }
       return;
     }
 

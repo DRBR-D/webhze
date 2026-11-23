@@ -136,11 +136,67 @@ export function revokeObjectUrls(root) {
 }
 
 /**
- * Mandatory Safari fallback for <dialog closedby="any"> per light-dismiss-a-dialog guide.
+ * Apple rubber-banding formula for soft boundary resistance (emil-apple-design §9).
  */
-export function wireDialogLightDismiss(dialog) {
+export function rubberband(overshoot, dimension = 180, constant = 0.55) {
+  return (overshoot * dimension * constant) / (dimension + constant * Math.abs(overshoot));
+}
+
+let supportsDisplayTransition;
+function canTransitionDisplay() {
+  if (supportsDisplayTransition !== undefined) return supportsDisplayTransition;
+  if (!window.CSS?.supports?.('transition-behavior', 'allow-discrete') || !document.body) {
+    return false;
+  }
+  const probe = document.createElement('div');
+  probe.style.cssText = 'transition: display 1s allow-discrete !important; display: block;';
+  document.body.appendChild(probe);
+  getComputedStyle(probe).display;
+  probe.style.display = 'none';
+  supportsDisplayTransition = getComputedStyle(probe).display === 'block';
+  probe.remove();
+  return supportsDisplayTransition;
+}
+
+function supportsTopLayerExit() {
+  return Boolean(window.CSS?.supports?.('overlay', 'auto') && canTransitionDisplay());
+}
+
+/**
+ * Smoothly closes a top-layer <dialog>, falling back to [data-closing] in Firefox/Safari
+ * where `overlay` or discrete `display` transitions aren't supported (animate-to-from-top-layer).
+ */
+export async function closeTopLayer(dialog) {
+  if (!dialog || !dialog.open) return;
+  if (!supportsTopLayerExit()) {
+    if (dialog.hasAttribute('data-closing')) return;
+    dialog.setAttribute('data-closing', '');
+    const animations = dialog.getAnimations ? dialog.getAnimations({ subtree: true }) : [];
+    if (animations.length > 0) {
+      await Promise.race([
+        Promise.allSettled(animations.map((a) => a.finished)),
+        new Promise((r) => setTimeout(r, 450)),
+      ]);
+    }
+    if (!dialog.hasAttribute('data-closing')) return;
+    dialog.removeAttribute('data-closing');
+  }
+  dialog.style.transform = '';
+  dialog.style.transition = '';
+  dialog.close();
+}
+
+/**
+ * Wires iOS Bottom Sheet / macOS Modal Sheet behavior on a native <dialog closedby="any">:
+ * - Safari fallback for `closedby="any"` light-dismiss
+ * - Smooth top-layer exit animation fallback on `cancel`
+ * - 1:1 Pointer-Events drag-to-dismiss with rubber-banding & release velocity handoff on mobile
+ */
+export function wireIosSheet(dialog) {
   if (!dialog || dialog.dataset.lightDismissWired) return;
   dialog.dataset.lightDismissWired = '1';
+
+  // Fallback for browsers without `closedby` support (Safari)
   if (!('closedBy' in HTMLDialogElement.prototype)) {
     dialog.addEventListener('click', (event) => {
       if (event.target !== dialog) return;
@@ -151,10 +207,90 @@ export function wireDialogLightDismiss(dialog) {
         rect.left <= event.clientX &&
         event.clientX <= rect.left + rect.width;
       if (inside) return;
-      dialog.close();
+      closeTopLayer(dialog);
     });
   }
+
+  // Intercept native Esc / light-dismiss cancel so exit animation plays in Firefox/Safari
+  dialog.addEventListener('cancel', (event) => {
+    if (!supportsTopLayerExit()) {
+      event.preventDefault();
+      closeTopLayer(dialog);
+    }
+  });
+
+  // 1:1 swipe-to-dismiss on the mobile bottom-sheet grabber/header
+  const handle = dialog.querySelector('[data-sheet-handle]');
+  if (!handle) return;
+
+  let dragging = false;
+  let activePointerId = null;
+  let startY = 0;
+  let currentOffset = 0;
+  let samples = [];
+
+  handle.addEventListener('pointerdown', (e) => {
+    if (window.innerWidth >= 768) return; // macOS centered sheet doesn't drag-dismiss
+    if (e.target.closest('button, a, input, select')) return;
+    if (dragging) return;
+    dragging = true;
+    activePointerId = e.pointerId;
+    startY = e.clientY;
+    currentOffset = 0;
+    samples = [{ y: e.clientY, t: performance.now() }];
+    handle.setPointerCapture(e.pointerId);
+    dialog.style.transition = 'none';
+  });
+
+  handle.addEventListener('pointermove', (e) => {
+    if (!dragging || e.pointerId !== activePointerId) return;
+    const rawDy = e.clientY - startY;
+    // Rubber-band when dragging upward past natural top edge
+    currentOffset = rawDy < 0 ? rubberband(rawDy, 160, 0.45) : rawDy;
+    dialog.style.transform = `translate3d(0, ${currentOffset.toFixed(1)}px, 0)`;
+    const now = performance.now();
+    samples.push({ y: e.clientY, t: now });
+    if (samples.length > 5) samples.shift();
+  });
+
+  function finishDrag(e) {
+    if (!dragging || e.pointerId !== activePointerId) return;
+    dragging = false;
+    activePointerId = null;
+
+    let velocity = 0; // px per ms
+    if (samples.length >= 2) {
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      const dt = Math.max(1, last.t - first.t);
+      velocity = (last.y - first.y) / dt;
+    }
+
+    const height = dialog.getBoundingClientRect().height || 400;
+    const shouldDismiss = currentOffset > height * 0.28 || (currentOffset > 24 && velocity > 0.42);
+
+    dialog.style.transition = 'transform 340ms cubic-bezier(0.32, 0.72, 0, 1)';
+    if (shouldDismiss) {
+      dialog.style.transform = `translate3d(0, ${Math.ceil(height + 40)}px, 0)`;
+      setTimeout(() => {
+        dialog.style.transform = '';
+        dialog.style.transition = '';
+        if (dialog.open) dialog.close();
+      }, 260);
+    } else {
+      dialog.style.transform = 'translate3d(0, 0, 0)';
+      setTimeout(() => {
+        dialog.style.transform = '';
+        dialog.style.transition = '';
+      }, 340);
+    }
+  }
+
+  handle.addEventListener('pointerup', finishDrag);
+  handle.addEventListener('pointercancel', finishDrag);
 }
+
+export const wireDialogLightDismiss = wireIosSheet;
 
 export function formatNumber(n) {
   const num = Number(n) || 0;

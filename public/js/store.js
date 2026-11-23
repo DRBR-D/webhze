@@ -223,6 +223,24 @@ export function applyColorSchemeToMeta(scheme) {
   if (meta) {
     meta.content = scheme === 'light' || scheme === 'dark' ? scheme : 'light dark';
   }
+  const themeMetas = document.querySelectorAll('meta[name="theme-color"]');
+  for (const m of themeMetas) {
+    if (scheme === 'dark') {
+      m.content = '#0B0B10';
+    } else if (scheme === 'light') {
+      m.content = '#F8F7F4';
+    } else {
+      m.content = m.media.includes('dark') ? '#0B0B10' : '#F8F7F4';
+    }
+  }
+}
+
+export function loadSidebarCollapsed() {
+  return safeGetItem('sidebar_collapsed') === 'true';
+}
+
+export function saveSidebarCollapsed(collapsed) {
+  safeSetItem('sidebar_collapsed', String(Boolean(collapsed)));
 }
 
 export function setColorSchemePreference(pref) {

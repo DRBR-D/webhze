@@ -22,6 +22,8 @@ import {
   setColorSchemePreference,
   toggleColorScheme,
   initThemeSync,
+  loadSidebarCollapsed,
+  saveSidebarCollapsed,
   getMetadata,
   upsertMetadata,
   toggleFavorite,
@@ -37,7 +39,8 @@ import {
   svgIcon,
   createMangaImg,
   revokeObjectUrls,
-  wireDialogLightDismiss,
+  wireIosSheet,
+  closeTopLayer,
   formatNumber,
   formatRelativeTime,
   formatUnixDate,
@@ -60,9 +63,45 @@ let favoriteIdSet = new Set();
 
 const appMain = document.getElementById('app-main');
 const appShell = document.getElementById('app-shell');
+const topHeader = document.getElementById('top-header');
+const toolbarTitleEl = document.getElementById('toolbar-title');
+const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const pointsBadge = document.getElementById('header-points-value');
 const rewardsDialog = document.getElementById('rewards-dialog');
 const rewardsDialogBody = document.getElementById('rewards-dialog-body');
+
+const ROUTE_TITLES = {
+  home: 'Khám phá',
+  search: 'Tìm kiếm',
+  favorites: 'Yêu thích',
+  history: 'Lịch sử đọc',
+  downloads: 'Tải offline',
+  detail: 'Chi tiết truyện',
+  reader: 'Đang đọc',
+};
+
+function setToolbarTitle(text) {
+  if (toolbarTitleEl) toolbarTitleEl.textContent = text || 'MangaFlow';
+}
+
+function setSidebarCollapsed(collapsed) {
+  appShell.classList.toggle('sidebar-collapsed', collapsed);
+  sidebarToggleBtn?.setAttribute('aria-expanded', String(!collapsed));
+  saveSidebarCollapsed(collapsed);
+}
+
+async function jumpToRandomManga() {
+  showToast('Đang chọn truyện ngẫu nhiên...');
+  try {
+    const randomBook = await fetchRandom();
+    if (randomBook?.id) {
+      await upsertMetadata(randomBook);
+      navigate(`/manga/${randomBook.id}`);
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') showToast(err.message || 'Không lấy được truyện ngẫu nhiên.', 'error');
+  }
+}
 
 async function refreshFavoriteIds() {
   const favs = await getFavorites();
@@ -77,6 +116,7 @@ function updateHeaderPoints() {
 function updateActiveNav(routeName) {
   const isReader = routeName === 'reader';
   appShell.classList.toggle('is-reader-route', isReader);
+  setToolbarTitle(ROUTE_TITLES[routeName] || 'MangaFlow');
 
   for (const link of document.querySelectorAll('[data-nav-route]')) {
     const active = link.dataset.navRoute === routeName;
@@ -231,6 +271,7 @@ async function mountHomeView(container) {
   const pageWrap = el(
     'div',
     { className: 'page-container' },
+    el('h1', { className: 'ios-large-title' }, 'Khám phá'),
     heroSectionHost,
     quickActions,
     el('section', { className: 'feed-section', 'aria-label': 'Danh sách truyện mới' }, feedHeader, gridEl, loadMoreHost, sentinel)
@@ -299,13 +340,13 @@ async function mountHomeView(container) {
             el(
               'div',
               { className: 'hero-info' },
-              el('span', { className: 'hero-kicker' }, `Phổ biến #${idx + 1}`),
               el('h2', { className: 'hero-title' }, title),
               el(
                 'div',
-                { className: 'hero-meta' },
+                { className: 'hero-meta tabular-nums' },
+                el('span', { className: 'meta-pill meta-rank' }, `Top ${idx + 1}`),
                 el('span', { className: 'meta-pill' }, `${book.num_pages || 0} trang`),
-                el('span', { className: 'meta-pill' }, svgIcon('heart', 14), formatNumber(book.num_favorites || 0)),
+                el('span', { className: 'meta-pill' }, svgIcon('heart', 13), formatNumber(book.num_favorites || 0)),
                 el('span', { className: 'meta-pill' }, `#${book.id}`)
               ),
               el(
@@ -322,7 +363,7 @@ async function mountHomeView(container) {
                       navigate(`/manga/${book.id}`);
                     },
                   },
-                  svgIcon('book', 18),
+                  svgIcon('book', 17),
                   'Xem chi tiết'
                 )
               )
@@ -497,8 +538,11 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
   const searchInput = el('input', {
     type: 'search',
     className: 'search-input',
-    placeholder: 'Nhập từ khóa, tag hoặc số ID truyện (vd: 177013)...',
+    placeholder: 'Từ khóa, tag hoặc số ID (vd: 177013)...',
     value: query,
+    enterkeyhint: 'search',
+    autocapitalize: 'none',
+    autocorrect: 'off',
     'aria-label': 'Tìm kiếm truyện theo từ khóa, tag hoặc ID',
   });
 
@@ -916,6 +960,7 @@ async function mountDetailView(container, { id }) {
   }
 
   const title = getBookTitle(book);
+  setToolbarTitle(title);
   const subTitle = getBookSubTitle(book);
   const coverUrl = getBookCoverUrl(book);
   const totalPages = book.num_pages || book.pages?.length || meta?.totalPages || 0;
@@ -1209,7 +1254,10 @@ function renderRewardsDialogContent() {
   const codeInput = el('input', {
     type: 'text',
     className: 'dialog-input',
-    placeholder: 'Nhập mã (vd: MANGA999, NHENTAI, LUCKY)',
+    placeholder: 'MANGA999, NHENTAI hoặc LUCKY',
+    enterkeyhint: 'done',
+    autocapitalize: 'characters',
+    autocorrect: 'off',
     'aria-label': 'Mã quà tặng',
   });
 
@@ -1401,7 +1449,59 @@ async function renderRoute() {
 // --- Boot ---
 
 function boot() {
-  wireDialogLightDismiss(rewardsDialog);
+  wireIosSheet(rewardsDialog);
+
+  setSidebarCollapsed(loadSidebarCollapsed());
+  sidebarToggleBtn?.addEventListener('click', () => {
+    setSidebarCollapsed(!appShell.classList.contains('sidebar-collapsed'));
+  });
+
+  document.getElementById('nav-back-btn')?.addEventListener('click', () => window.history.back());
+  document.getElementById('nav-forward-btn')?.addEventListener('click', () => window.history.forward());
+  document.getElementById('sidebar-random-btn')?.addEventListener('click', jumpToRandomManga);
+
+  const toolbarSearchForm = document.getElementById('toolbar-search-form');
+  const toolbarSearchInput = document.getElementById('toolbar-search-input');
+  toolbarSearchForm?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const val = toolbarSearchInput.value.trim();
+    if (!val) {
+      navigate('/search');
+      return;
+    }
+    if (/^\d+$/.test(val)) {
+      navigate(`/manga/${val}`);
+    } else {
+      navigate(`/search?q=${encodeURIComponent(val)}`);
+    }
+    toolbarSearchInput.blur();
+  });
+
+  // Scroll-edge & iOS Large Title collapse detection
+  const updateScrollChrome = () => {
+    topHeader?.classList.toggle('is-scrolled', window.scrollY > 24);
+  };
+  window.addEventListener('scroll', updateScrollChrome, { passive: true });
+  updateScrollChrome();
+
+  // macOS keyboard shortcuts (zero animation on keyboard-initiated actions)
+  window.addEventListener('keydown', (e) => {
+    if (rewardsDialog.open) return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      if (window.innerWidth >= 900 && toolbarSearchInput) {
+        toolbarSearchInput.focus();
+        toolbarSearchInput.select();
+      } else {
+        navigate('/search');
+      }
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === '\\') {
+      e.preventDefault();
+      setSidebarCollapsed(!appShell.classList.contains('sidebar-collapsed'));
+    }
+  });
 
   initThemeSync(() => {
     if (rewardsDialog.open) renderRewardsDialogContent();
@@ -1413,9 +1513,9 @@ function boot() {
   });
 
   document.getElementById('rewards-open-btn')?.addEventListener('click', openRewardsDialog);
-  document.getElementById('rewards-close-btn')?.addEventListener('click', () => rewardsDialog.close());
+  document.getElementById('rewards-close-btn')?.addEventListener('click', () => closeTopLayer(rewardsDialog));
 
-  // Intercept internal navigation links in header & bottom nav
+  // Intercept internal navigation links in sidebar, tablet nav, header & iOS tab bar
   for (const link of document.querySelectorAll('a[data-spa-link]')) {
     link.addEventListener('click', (e) => {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
