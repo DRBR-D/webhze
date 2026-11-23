@@ -1,6 +1,7 @@
 export const IMG_SERVERS = [1, 2, 3];
 export const THUMB_SERVERS = [1, 2, 3, 4];
 export const PAGE_CACHE_NAME = 'manga-pages-v1';
+export const TRANSLATED_CACHE_NAME = 'manga-translated-v1';
 
 export function pickServer(servers, mediaId) {
   let hash = 0;
@@ -204,4 +205,161 @@ export async function getCachedImageObjectUrl(remoteUrl) {
   } catch {
     return null;
   }
+}
+
+// --- Laptop GPU AI Translation API & Browser Cache ---
+
+export function detectBookLanguage(book) {
+  const tags = (book?.tags || []).map((t) => String(t?.name || '').toLowerCase());
+  if (tags.includes('english')) return { sourceLang: 'en', readingDir: 'ltr', label: 'English' };
+  if (tags.includes('korean')) return { sourceLang: 'ko', readingDir: 'ltr', label: 'Korean' };
+  if (tags.includes('chinese')) return { sourceLang: 'zh', readingDir: 'rtl', label: 'Chinese' };
+  if (tags.includes('japanese')) return { sourceLang: 'ja', readingDir: 'rtl', label: 'Japanese' };
+  return { sourceLang: 'auto', readingDir: 'rtl', label: 'Auto' };
+}
+
+export function translatedCacheKey(bookId, pageNum, targetLang = 'vi') {
+  return `/translated-cache/${bookId}/${pageNum}/${targetLang}`;
+}
+
+export async function fetchTranslateStatus(signal) {
+  try {
+    const res = await fetch('/api/translate/status', {
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+      signal,
+    });
+    if (!res.ok) return { online: false, configured: false, worker: null };
+    return await res.json();
+  } catch {
+    return { online: false, configured: false, worker: null };
+  }
+}
+
+export async function getTranslatedPageObjectUrl(bookId, pageNum, targetLang = 'vi') {
+  if (!bookId || !pageNum || !('caches' in window)) return null;
+  try {
+    const cache = await caches.open(TRANSLATED_CACHE_NAME);
+    const match = await cache.match(translatedCacheKey(bookId, pageNum, targetLang));
+    if (!match) return null;
+    const blob = await match.blob();
+    return URL.createObjectURL(blob);
+  } catch {
+    return null;
+  }
+}
+
+export async function countTranslatedPages(book, targetLang = 'vi') {
+  const pages = book?.pages || [];
+  if (!pages.length || !('caches' in window)) return { done: 0, total: pages.length };
+  try {
+    const cache = await caches.open(TRANSLATED_CACHE_NAME);
+    let done = 0;
+    for (const p of pages) {
+      const hit = await cache.match(translatedCacheKey(book.id, p.number, targetLang));
+      if (hit) done++;
+    }
+    return { done, total: pages.length };
+  } catch {
+    return { done: 0, total: pages.length };
+  }
+}
+
+export async function clearBookTranslation(book, targetLang = 'vi') {
+  if (!book?.pages?.length || !('caches' in window)) return;
+  const cache = await caches.open(TRANSLATED_CACHE_NAME);
+  for (const p of book.pages) {
+    await cache.delete(translatedCacheKey(book.id, p.number, targetLang));
+  }
+}
+
+export async function translateSinglePage(
+  book,
+  pageObj,
+  { sourceLang = null, readingDir = null, targetLang = 'vi', force = false, signal } = {}
+) {
+  const imageUrl = fullImageUrl(pageObj?.path, book?.media_id);
+  if (!imageUrl) throw new Error('Thiếu đường dẫn ảnh trang.');
+  const detected = detectBookLanguage(book);
+
+  const res = await fetch('/api/translate/page', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({
+      bookId: Number(book.id),
+      page: Number(pageObj.number),
+      imageUrl,
+      sourceLang: sourceLang || detected.sourceLang,
+      targetLang,
+      readingDir: readingDir || detected.readingDir,
+      force,
+    }),
+    signal,
+  });
+
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) {
+    const err = new Error(data?.error || `Lỗi dịch trang ${pageObj.number} (${res.status})`);
+    err.status = res.status;
+    err.online = data?.online;
+    throw err;
+  }
+
+  // Fetch translated WebP binary and persist in browser Cache API so revisiting is instant
+  const imgRes = await fetch(data.imageUrl, { signal });
+  if (!imgRes.ok) throw new Error(`Không tải được ảnh đã dịch trang ${pageObj.number}.`);
+  const cloned = imgRes.clone();
+  if ('caches' in window) {
+    const cache = await caches.open(TRANSLATED_CACHE_NAME);
+    await cache.put(translatedCacheKey(book.id, pageObj.number, targetLang), cloned);
+  }
+  const blob = await imgRes.blob();
+  return {
+    objectUrl: URL.createObjectURL(blob),
+    meta: data.meta || {},
+    cached: Boolean(data.cached),
+  };
+}
+
+/**
+ * Translates all pages of a book sequentially before entering Reader
+ * ("khi chưa vô truyện nhấn nút dịch, khi nào xong mới vô coi").
+ */
+export async function translateBookPages(
+  book,
+  { sourceLang = null, targetLang = 'vi', force = false, signal, onProgress } = {}
+) {
+  const pages = book?.pages || [];
+  if (!pages.length) throw new Error('Truyện chưa có dữ liệu trang để dịch.');
+
+  const detected = detectBookLanguage(book);
+  const lang = sourceLang || detected.sourceLang;
+  const readingDir = detected.readingDir;
+  const cache = 'caches' in window ? await caches.open(TRANSLATED_CACHE_NAME) : null;
+  let done = 0;
+  const total = pages.length;
+
+  for (const p of pages) {
+    if (signal?.aborted) throw new DOMException('Đã hủy dịch truyện', 'AbortError');
+    if (!force && cache) {
+      const hit = await cache.match(translatedCacheKey(book.id, p.number, targetLang));
+      if (hit) {
+        done++;
+        onProgress?.(done, total, { cached: true, page: p.number });
+        continue;
+      }
+    }
+    const res = await translateSinglePage(book, p, {
+      sourceLang: lang,
+      readingDir,
+      targetLang,
+      force,
+      signal,
+    });
+    URL.revokeObjectURL(res.objectUrl);
+    done++;
+    onProgress?.(done, total, { ...res.meta, page: p.number });
+  }
+  return { done, total };
 }

@@ -4,6 +4,10 @@ import {
   proxyImageUrl,
   getBookTitle,
   getCachedImageObjectUrl,
+  getTranslatedPageObjectUrl,
+  countTranslatedPages,
+  fetchTranslateStatus,
+  translateSinglePage,
 } from './api.js';
 import {
   getMetadata,
@@ -30,7 +34,7 @@ const EYE_FILTERS = [
 
 const AUTO_SPEEDS = [1, 2, 3, 4, 5];
 
-function hydratePageImg(img, page, mediaId, priority = 'auto') {
+function hydratePageImg(img, page, mediaId, priority = 'auto', { bookId = null, useTranslated = false } = {}) {
   if (!img || img.dataset.hydrated === '1') return Promise.resolve();
   const remoteUrl = fullImageUrl(page.path, mediaId);
   if (!remoteUrl) return Promise.resolve();
@@ -62,18 +66,38 @@ function hydratePageImg(img, page, mediaId, priority = 'auto') {
       }
     });
 
-    getCachedImageObjectUrl(remoteUrl).then((objUrl) => {
-      if (objUrl) {
-        img.dataset.objectUrl = objUrl;
-        img.src = objUrl;
-      }
-    });
-    img.src = remoteUrl;
-    if (img.complete && img.naturalWidth > 0) finish();
+    const loadOriginal = () => {
+      getCachedImageObjectUrl(remoteUrl).then((objUrl) => {
+        if (objUrl) {
+          img.dataset.objectUrl = objUrl;
+          img.src = objUrl;
+        }
+      });
+      img.src = remoteUrl;
+      if (img.complete && img.naturalWidth > 0) finish();
+    };
+
+    if (useTranslated && bookId) {
+      getTranslatedPageObjectUrl(bookId, page.number, 'vi').then((transUrl) => {
+        if (transUrl) {
+          img.dataset.objectUrl = transUrl;
+          img.src = transUrl;
+          if (img.complete && img.naturalWidth > 0) finish();
+        } else {
+          loadOriginal();
+        }
+      });
+    } else {
+      loadOriginal();
+    }
   });
 }
 
-function createPageImg(page, mediaId, { priority = 'lazy', deferLoad = false, previewCoverUrl = '' } = {}) {
+function createPageImg(
+  page,
+  mediaId,
+  { priority = 'lazy', deferLoad = false, previewCoverUrl = '', bookId = null, useTranslated = false } = {}
+) {
   const img = document.createElement('img');
   img.alt = `Trang ${page.number}`;
   img.className = 'reader-page-img';
@@ -94,7 +118,7 @@ function createPageImg(page, mediaId, { priority = 'lazy', deferLoad = false, pr
     img.style.backgroundRepeat = 'no-repeat';
   }
   if (!deferLoad) {
-    hydratePageImg(img, page, mediaId, priority);
+    hydratePageImg(img, page, mediaId, priority, { bookId, useTranslated });
   }
   return img;
 }
@@ -103,10 +127,16 @@ export async function mountReaderView(
   container,
   { id, page: initialPage },
   navigate,
-  { initialBook = null, heroTransition = null, goBack = null } = {}
+  { initialBook = null, heroTransition = null, goBack = null, langMode: initialLangMode = 'auto', signal = null } = {}
 ) {
   const cleanups = [];
   const abortController = new AbortController();
+  if (signal) {
+    if (signal.aborted) return () => {};
+    const onAbort = () => abortController.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    cleanups.push(() => signal.removeEventListener('abort', onAbort));
+  }
   cleanups.push(() => abortController.abort());
 
   const exitToDetail = () => {
@@ -128,6 +158,8 @@ export async function mountReaderView(
   let currentPage = Math.max(1, Number(initialPage) || 1);
   let book = initialBook?.pages?.length ? initialBook : null;
   let totalPages = 0;
+  let langMode = initialLangMode === 'vi' ? 'vi' : 'orig';
+  let hasTranslatedPages = initialLangMode === 'vi';
 
   let rafId = 0;
   let lastFrameTs = 0;
@@ -152,13 +184,17 @@ export async function mountReaderView(
 
     try {
       const meta = await getMetadata(id);
+      if (abortController.signal.aborted) return () => cleanups.forEach((fn) => fn());
       if (meta?.bookJson?.pages?.length) {
         book = meta.bookJson;
       } else {
         book = await fetchBook(id, abortController.signal);
       }
+      if (abortController.signal.aborted) return () => cleanups.forEach((fn) => fn());
     } catch (err) {
-      if (err.name === 'AbortError') return () => {};
+      if (err.name === 'AbortError' || abortController.signal.aborted) {
+        return () => cleanups.forEach((fn) => fn());
+      }
       root.replaceChildren(
         el(
           'div',
@@ -237,6 +273,39 @@ export async function mountReaderView(
     el('span', { className: 'auto-pill-text' }, `Auto ${autoScrollSpeed}x · Tap to pause`)
   );
 
+  const langToggleBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: `reader-lang-pill ${langMode === 'vi' ? 'is-vi' : ''}`.trim(),
+      hidden: !hasTranslatedPages,
+      'aria-label': 'Chuyển giữa bản dịch Tiếng Việt và bản gốc',
+      title: 'Chuyển bản dịch Tiếng Việt / bản gốc',
+      onClick: () => {
+        langMode = langMode === 'vi' ? 'orig' : 'vi';
+        langToggleBtn.textContent = langMode === 'vi' ? 'VI' : 'Gốc';
+        langToggleBtn.classList.toggle('is-vi', langMode === 'vi');
+        renderStage();
+        showToast(langMode === 'vi' ? 'Đang xem bản dịch Tiếng Việt' : 'Đang xem bản gốc');
+      },
+    },
+    langMode === 'vi' ? 'VI' : 'Gốc'
+  );
+
+  // Detect if this book already has translated pages in cache (so VI/Gốc pill appears automatically)
+  countTranslatedPages(book, 'vi').then(({ done }) => {
+    if (done > 0) {
+      hasTranslatedPages = true;
+      langToggleBtn.hidden = false;
+      if (initialLangMode === 'auto' && langMode !== 'vi') {
+        langMode = 'vi';
+        langToggleBtn.textContent = 'VI';
+        langToggleBtn.classList.add('is-vi');
+        renderStage();
+      }
+    }
+  });
+
   const zoomCycleBtn = el(
     'button',
     {
@@ -272,6 +341,7 @@ export async function mountReaderView(
       el('h1', { className: 'reader-title' }, titleText),
       topSubCounter
     ),
+    langToggleBtn,
     zoomCycleBtn
   );
 
@@ -479,7 +549,10 @@ export async function mountReaderView(
     // Hydrate vertical DOM img directly if present
     const domImg = verticalImgMap.get(pageNum);
     if (domImg && domImg.dataset.hydrated !== '1') {
-      return hydratePageImg(domImg, p, book.media_id, 'auto');
+      return hydratePageImg(domImg, p, book.media_id, 'auto', {
+        bookId: id,
+        useTranslated: langMode === 'vi',
+      });
     }
 
     if (retainedPreloads.has(pageNum)) return Promise.resolve();
@@ -530,7 +603,10 @@ export async function mountReaderView(
     const curImg = verticalImgMap.get(pageNum);
     const curPageObj = pages[pageNum - 1];
     if (curImg && curPageObj && curImg.dataset.hydrated !== '1') {
-      hydratePageImg(curImg, curPageObj, book.media_id, 'high');
+      hydratePageImg(curImg, curPageObj, book.media_id, 'high', {
+        bookId: id,
+        useTranslated: langMode === 'vi',
+      });
     }
 
     // Evict decoded off-screen cache far from sliding window to keep mobile RAM lean
@@ -588,6 +664,8 @@ export async function mountReaderView(
           priority: isCurrent ? 'high' : 'auto',
           deferLoad: !isCurrent,
           previewCoverUrl: useCoverPreview ? pendingCoverFly.imgSrc : '',
+          bookId: id,
+          useTranslated: langMode === 'vi',
         });
         verticalImgMap.set(pageNum, img);
         if (useCoverPreview) flyTargetImg = img;
@@ -639,6 +717,8 @@ export async function mountReaderView(
     const img = createPageImg(p, book.media_id, {
       priority: 'high',
       previewCoverUrl: useCoverFly ? pendingCoverFly.imgSrc : '',
+      bookId: id,
+      useTranslated: langMode === 'vi',
     });
     stage.replaceChildren(
       el('div', { className: `reader-horizontal-frame ${animClass}`.trim() }, img)

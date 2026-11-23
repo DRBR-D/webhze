@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -199,7 +200,346 @@ async function serveStatic(res, pathname) {
   res.end(data);
 }
 
-export function createAppServer({ upstreamBase = process.env.API_UPSTREAM || DEFAULT_UPSTREAM } = {}) {
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(Object.assign(new Error('Payload quá lớn.'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function timingSafeTokenMatch(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function extractWorkerToken(req, urlObj) {
+  const auth = req.headers.authorization || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  if (req.headers['x-worker-token']) return String(req.headers['x-worker-token']).trim();
+  return urlObj.searchParams.get('token') || '';
+}
+
+function createTranslationHub({ workerToken = '', maxCacheEntries = 32, allowLocalImages = false } = {}) {
+  const cache = new Map(); // cacheKey -> { buffer, contentType, meta, createdAt }
+  const inflight = new Map(); // cacheKey -> Promise
+  const pendingJobs = new Map(); // jobId -> { resolve, reject, timer, cacheKey }
+  const jobQueue = [];
+  let activeWorker = null;
+  let jobSeq = 0;
+
+  function cacheGet(key) {
+    const hit = cache.get(key);
+    if (!hit) return null;
+    // Refresh LRU recency
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+
+  function cacheSet(key, entry) {
+    if (cache.has(key)) cache.delete(key);
+    cache.set(key, entry);
+    while (cache.size > maxCacheEntries) {
+      const oldestKey = cache.keys().next().value;
+      cache.delete(oldestKey);
+    }
+  }
+
+  function sendSseEvent(worker, eventName, payload) {
+    if (!worker || worker.res.writableEnded) return false;
+    try {
+      worker.res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function flushQueue() {
+    while (activeWorker && jobQueue.length > 0) {
+      const job = jobQueue.shift();
+      if (!pendingJobs.has(job.jobId)) continue;
+      if (!sendSseEvent(activeWorker, 'job', job)) {
+        jobQueue.unshift(job);
+        break;
+      }
+    }
+  }
+
+  function disconnectWorker(worker) {
+    if (activeWorker !== worker) return;
+    clearInterval(worker.pingTimer);
+    activeWorker = null;
+    // Fail any in-flight jobs cleanly so clients are not left hanging
+    for (const [jobId, pending] of pendingJobs.entries()) {
+      clearTimeout(pending.timer);
+      pendingJobs.delete(jobId);
+      pending.reject(Object.assign(new Error('Laptop dịch vừa ngắt kết nối.'), { statusCode: 503 }));
+    }
+    jobQueue.length = 0;
+  }
+
+  function getStatus() {
+    return {
+      online: Boolean(activeWorker && !activeWorker.res.writableEnded),
+      configured: Boolean(workerToken),
+      worker: activeWorker
+        ? {
+            name: activeWorker.name,
+            gpu: activeWorker.gpu,
+            model: activeWorker.model,
+            connectedAt: activeWorker.connectedAt,
+          }
+        : null,
+      queueSize: jobQueue.length,
+      inFlight: pendingJobs.size,
+      cachedCount: cache.size,
+    };
+  }
+
+  function handleWorkerStream(req, res, urlObj) {
+    if (!workerToken) {
+      return sendJson(res, 503, { error: 'Server chưa cấu hình WORKER_TOKEN.' });
+    }
+    const provided = extractWorkerToken(req, urlObj);
+    if (!timingSafeTokenMatch(provided, workerToken)) {
+      return sendJson(res, 401, { error: 'WORKER_TOKEN không đúng.' });
+    }
+
+    // Replace previous stale worker connection cleanly
+    if (activeWorker) {
+      clearInterval(activeWorker.pingTimer);
+      try { activeWorker.res.end(); } catch {}
+      activeWorker = null;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    const worker = {
+      res,
+      name: String(req.headers['x-worker-name'] || urlObj.searchParams.get('name') || 'Arch-GPU-Worker').slice(0, 64),
+      gpu: String(req.headers['x-worker-gpu'] || urlObj.searchParams.get('gpu') || 'RTX 3050').slice(0, 64),
+      model: String(req.headers['x-worker-model'] || urlObj.searchParams.get('model') || 'gemini').slice(0, 64),
+      connectedAt: Date.now(),
+      pingTimer: null,
+    };
+    activeWorker = worker;
+    sendSseEvent(worker, 'connected', { ok: true, ts: Date.now() });
+
+    worker.pingTimer = setInterval(() => {
+      if (worker.res.writableEnded) {
+        disconnectWorker(worker);
+        return;
+      }
+      try {
+        worker.res.write(`: ping ${Date.now()}\n\n`);
+      } catch {
+        disconnectWorker(worker);
+      }
+    }, 20000);
+
+    req.on('close', () => disconnectWorker(worker));
+    req.on('error', () => disconnectWorker(worker));
+    flushQueue();
+  }
+
+  async function handleWorkerResult(req, res, urlObj) {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method Not Allowed' });
+    if (!workerToken) return sendJson(res, 503, { error: 'Server chưa cấu hình WORKER_TOKEN.' });
+    const provided = extractWorkerToken(req, urlObj);
+    if (!timingSafeTokenMatch(provided, workerToken)) {
+      return sendJson(res, 401, { error: 'WORKER_TOKEN không đúng.' });
+    }
+
+    const jobId = urlObj.pathname.slice('/api/worker/result/'.length).trim();
+    const pending = pendingJobs.get(jobId);
+    const body = await readBody(req, 10 * 1024 * 1024); // 10 MB max per translated page
+    const contentType = String(req.headers['content-type'] || '').toLowerCase();
+
+    if (!pending) {
+      return sendJson(res, 404, { error: 'Job không tồn tại hoặc đã hết hạn.' });
+    }
+
+    clearTimeout(pending.timer);
+    pendingJobs.delete(jobId);
+
+    if (contentType.startsWith('application/json')) {
+      let parsed = {};
+      try { parsed = JSON.parse(body.toString('utf8')); } catch {}
+      pending.reject(Object.assign(new Error(parsed.error || 'Worker dịch thất bại.'), { statusCode: 502 }));
+      return sendJson(res, 200, { ok: true });
+    }
+
+    if (!contentType.startsWith('image/') || body.length < 32) {
+      pending.reject(Object.assign(new Error('Dữ liệu ảnh trả về không hợp lệ.'), { statusCode: 502 }));
+      return sendJson(res, 400, { error: 'Cần gửi ảnh (image/webp hoặc image/png).' });
+    }
+
+    let meta = {};
+    const metaHeader = req.headers['x-translate-meta'];
+    if (metaHeader) {
+      try { meta = JSON.parse(String(metaHeader)); } catch {}
+    }
+
+    const entry = {
+      buffer: body,
+      contentType: contentType.split(';')[0],
+      meta,
+      createdAt: Date.now(),
+    };
+    cacheSet(pending.cacheKey, entry);
+    pending.resolve(entry);
+    return sendJson(res, 200, { ok: true, bytes: body.length });
+  }
+
+  async function handleTranslatePage(req, res) {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'Method Not Allowed' });
+    const raw = await readBody(req, 64 * 1024);
+    let body;
+    try {
+      body = JSON.parse(raw.toString('utf8'));
+    } catch {
+      return sendJson(res, 400, { error: 'JSON không hợp lệ.' });
+    }
+
+    const bookId = Number(body.bookId);
+    const page = Number(body.page);
+    const sourceLang = String(body.sourceLang || 'auto').slice(0, 24);
+    const targetLang = String(body.targetLang || 'vi').slice(0, 12);
+    const readingDir = body.readingDir === 'ltr' ? 'ltr' : 'rtl';
+    const force = Boolean(body.force);
+
+    if (!Number.isInteger(bookId) || bookId <= 0 || !Number.isInteger(page) || page <= 0) {
+      return sendJson(res, 400, { error: 'bookId hoặc page không hợp lệ.' });
+    }
+
+    const rawImageUrl = String(body.imageUrl || '');
+    const safeRemoteUrl = validateImageUrl(rawImageUrl);
+    const isAllowedLocal = allowLocalImages && /^http:\/\/127\.0\.0\.1:\d+\/img\//.test(rawImageUrl);
+    const imageUrl = safeRemoteUrl || (isAllowedLocal ? rawImageUrl : null);
+    if (!imageUrl) {
+      return sendJson(res, 400, { error: 'URL ảnh không hợp lệ.' });
+    }
+
+    const cacheKey = `${bookId}_${page}_${targetLang}`;
+    if (!force) {
+      const hit = cacheGet(cacheKey);
+      if (hit) {
+        return sendJson(res, 200, {
+          status: 'done',
+          cached: true,
+          imageUrl: `/api/translate/image/${encodeURIComponent(cacheKey)}?v=${hit.createdAt}`,
+          meta: hit.meta,
+        });
+      }
+    }
+
+    if (!activeWorker || activeWorker.res.writableEnded) {
+      return sendJson(res, 503, {
+        error: 'Laptop dịch chưa kết nối. Hãy mở script worker trên laptop để dịch.',
+        online: false,
+      });
+    }
+
+    let promise = inflight.get(cacheKey);
+    if (!promise) {
+      const jobId = `j_${Date.now()}_${++jobSeq}`;
+      const proxyPath = safeRemoteUrl ? `/api/img?url=${encodeURIComponent(safeRemoteUrl)}` : null;
+
+      promise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingJobs.delete(jobId);
+          reject(Object.assign(new Error('Quá thời gian chờ laptop dịch trang này (95s).'), { statusCode: 504 }));
+        }, 95000);
+
+        pendingJobs.set(jobId, { resolve, reject, timer, cacheKey });
+        jobQueue.push({
+          jobId,
+          bookId,
+          page,
+          imageUrl,
+          proxyPath,
+          sourceLang,
+          targetLang,
+          readingDir,
+        });
+        flushQueue();
+      }).finally(() => {
+        inflight.delete(cacheKey);
+      });
+
+      inflight.set(cacheKey, promise);
+    }
+
+    try {
+      const entry = await promise;
+      return sendJson(res, 200, {
+        status: 'done',
+        cached: false,
+        imageUrl: `/api/translate/image/${encodeURIComponent(cacheKey)}?v=${entry.createdAt}`,
+        meta: entry.meta,
+      });
+    } catch (err) {
+      return sendJson(res, err.statusCode || 502, {
+        error: err.message || 'Lỗi dịch trang truyện.',
+        online: Boolean(activeWorker),
+      });
+    }
+  }
+
+  function handleTranslateImage(req, res, urlObj) {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'Method Not Allowed' });
+    const cacheKey = decodeURIComponent(urlObj.pathname.slice('/api/translate/image/'.length));
+    if (!/^\d+_\d+_[a-zA-Z0-9-]+$/.test(cacheKey)) {
+      return sendJson(res, 400, { error: 'Key ảnh không hợp lệ.' });
+    }
+    const hit = cacheGet(cacheKey);
+    if (!hit) {
+      return sendJson(res, 404, { error: 'Ảnh dịch đã hết hạn cache.' });
+    }
+    res.writeHead(200, {
+      'Content-Type': hit.contentType || 'image/webp',
+      'Cache-Control': 'public, max-age=3600',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    res.end(hit.buffer);
+  }
+
+  return {
+    getStatus,
+    handleWorkerStream,
+    handleWorkerResult,
+    handleTranslatePage,
+    handleTranslateImage,
+  };
+}
+
+export function createAppServer({
+  upstreamBase = process.env.API_UPSTREAM || DEFAULT_UPSTREAM,
+  workerToken = process.env.WORKER_TOKEN || '',
+  allowLocalImages = false,
+} = {}) {
+  const hub = createTranslationHub({ workerToken, allowLocalImages });
+
   return http.createServer(async (req, res) => {
     try {
       const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -209,9 +549,24 @@ export function createAppServer({ upstreamBase = process.env.API_UPSTREAM || DEF
       if (urlObj.pathname === '/api/img') {
         return await handleImageProxy(req, res, urlObj);
       }
+      if (urlObj.pathname === '/api/translate/status') {
+        return sendJson(res, 200, hub.getStatus());
+      }
+      if (urlObj.pathname === '/api/translate/page') {
+        return await hub.handleTranslatePage(req, res);
+      }
+      if (urlObj.pathname.startsWith('/api/translate/image/')) {
+        return hub.handleTranslateImage(req, res, urlObj);
+      }
+      if (urlObj.pathname === '/api/worker/stream') {
+        return hub.handleWorkerStream(req, res, urlObj);
+      }
+      if (urlObj.pathname.startsWith('/api/worker/result/')) {
+        return await hub.handleWorkerResult(req, res, urlObj);
+      }
       return await serveStatic(res, urlObj.pathname);
     } catch (err) {
-      sendJson(res, 500, { error: 'Internal Server Error', message: err.message });
+      sendJson(res, err.statusCode || 500, { error: err.message || 'Internal Server Error' });
     }
   });
 }

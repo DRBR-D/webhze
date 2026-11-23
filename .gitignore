@@ -1,1 +1,8 @@
 node_modules/
+.env
+worker/.env
+worker/.venv/
+worker/__pycache__/
+worker/models/
+*.pyc
+.DS_Store

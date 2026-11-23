@@ -1,0 +1,8 @@
+pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.9
+rapidocr>=3.0
+onnxruntime>=1.18
+requests>=2.31
+deep-translator>=1.11
+torch>=2.3

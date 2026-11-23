@@ -211,3 +211,121 @@ test('HTTP server proxies API with required headers and serves SPA routes', asyn
   const iconBytes = new Uint8Array(await iconRes.arrayBuffer());
   assert.deepEqual([...iconBytes.slice(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
 });
+
+test('Translation worker SSE bridge: auth, dispatch, WebP result, LRU cache, and offline fallback', async (t) => {
+  const secret = 'test-worker-secret-123';
+  const appServer = createAppServer({ workerToken: secret });
+  await new Promise((resolve) => appServer.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${appServer.address().port}`;
+  t.after(() => appServer.close());
+
+  // 1. Offline status before worker connects
+  const stOff = await (await fetch(`${base}/api/translate/status`)).json();
+  assert.equal(stOff.online, false);
+  assert.equal(stOff.configured, true);
+
+  // 2. Rejects unauthorized worker SSE & offline translate request
+  const badAuth = await fetch(`${base}/api/worker/stream`, { headers: { 'X-Worker-Token': 'wrong' } });
+  assert.equal(badAuth.status, 401);
+
+  const offReq = await fetch(`${base}/api/translate/page`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      bookId: 1001,
+      page: 1,
+      imageUrl: 'https://i1.nhentai.net/galleries/555/1.webp',
+      sourceLang: 'ja',
+    }),
+  });
+  assert.equal(offReq.status, 503);
+
+  // 3. Connect mock worker via SSE stream and fulfill dispatched job
+  const workerAbort = new AbortController();
+  t.after(() => workerAbort.abort());
+  const sseRes = await fetch(`${base}/api/worker/stream`, {
+    headers: {
+      'X-Worker-Token': secret,
+      'X-Worker-GPU': 'RTX 3050 Test',
+      'X-Worker-Model': 'gemini-4-hydrogen',
+    },
+    signal: workerAbort.signal,
+  });
+  assert.equal(sseRes.status, 200);
+
+  const stOn = await (await fetch(`${base}/api/translate/status`)).json();
+  assert.equal(stOn.online, true);
+  assert.equal(stOn.worker.gpu, 'RTX 3050 Test');
+
+  // Fake valid WebP header bytes (RIFF....WEBP)
+  const fakeWebp = Buffer.concat([Buffer.from('RIFF\x24\x00\x00\x00WEBPVP8 '), Buffer.alloc(32, 1)]);
+
+  // Consume SSE stream in background and POST back result on receiving `event: job`
+  const reader = sseRes.body.getReader();
+  const dec = new TextDecoder();
+  let sseBuf = '';
+  const workerLoop = (async () => {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      sseBuf += dec.decode(value, { stream: true });
+      const parts = sseBuf.split('\n\n');
+      sseBuf = parts.pop() || '';
+      for (const frame of parts) {
+        if (!frame.includes('event: job')) continue;
+        const dataLine = frame.split('\n').find((l) => l.startsWith('data:'));
+        if (!dataLine) continue;
+        const job = JSON.parse(dataLine.slice(5).trim());
+        const postRes = await fetch(`${base}/api/worker/result/${job.jobId}`, {
+          method: 'POST',
+          headers: {
+            'X-Worker-Token': secret,
+            'Content-Type': 'image/webp',
+            'X-Translate-Meta': JSON.stringify({ bubbles: 3, model: 'gemini-3.5-flash-lite' }),
+          },
+          body: fakeWebp,
+        });
+        assert.equal(postRes.status, 200);
+        return job;
+      }
+    }
+  })();
+
+  const trRes = await fetch(`${base}/api/translate/page`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      bookId: 1001,
+      page: 1,
+      imageUrl: 'https://i1.nhentai.net/galleries/555/1.webp',
+      sourceLang: 'ja',
+      targetLang: 'vi',
+      readingDir: 'rtl',
+    }),
+  });
+  assert.equal(trRes.status, 200);
+  const trJson = await trRes.json();
+  assert.equal(trJson.status, 'done');
+  assert.equal(trJson.cached, false);
+  assert.equal(trJson.meta.bubbles, 3);
+  await workerLoop;
+
+  // 4. Cached translated image serves binary WebP & repeat translate request hits LRU cache
+  const imgRes = await fetch(`${base}${trJson.imageUrl}`);
+  assert.equal(imgRes.status, 200);
+  assert.equal(imgRes.headers.get('content-type'), 'image/webp');
+  assert.equal((await imgRes.arrayBuffer()).byteLength, fakeWebp.length);
+
+  const cachedRes = await (
+    await fetch(`${base}/api/translate/page`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bookId: 1001,
+        page: 1,
+        imageUrl: 'https://i1.nhentai.net/galleries/555/1.webp',
+      }),
+    })
+  ).json();
+  assert.equal(cachedRes.cached, true);
+});

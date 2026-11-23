@@ -11,6 +11,11 @@ import {
   fullThumbUrl,
   downloadBookPages,
   removeBookCache,
+  detectBookLanguage,
+  fetchTranslateStatus,
+  countTranslatedPages,
+  translateBookPages,
+  clearBookTranslation,
 } from './api.js';
 import {
   loadUserState,
@@ -65,6 +70,8 @@ const SORT_OPTIONS = [
 const TAG_DOT_COLORS = ['#FF5A36', '#FF4D8D', '#FFB347', '#38BDF8', '#34D399', '#A855F7'];
 
 let activeCleanup = null;
+let routeSeq = 0;
+let routeAbortController = null;
 let favoriteIdSet = new Set();
 let historyMap = new Map();
 let cachedPopularList = [];
@@ -78,6 +85,7 @@ const bookMemoryCache = new Map();
 let homeCache = null;
 const searchCache = new Map();
 let pendingHeroTransition = null;
+let pendingReaderLangMode = 'auto';
 let syncHeaderChromeFn = null;
 
 function cacheBook(book) {
@@ -138,8 +146,9 @@ function openBookDetail(book, sourceEl = null) {
   navigate(`/manga/${book.id}`);
 }
 
-function openBookReader(book, page = 1, sourceEl = null) {
+function openBookReader(book, page = 1, sourceEl = null, { langMode = 'auto' } = {}) {
   const targetPage = Math.max(1, Number(page) || 1);
+  pendingReaderLangMode = langMode;
   if (sourceEl) {
     captureHeroTransition('to-reader', book, sourceEl, { page: targetPage });
   } else {
@@ -1327,9 +1336,15 @@ async function mountCollectionView(container, kind) {
 
 // --- Screen 6: Detail (`/manga/:id`) — Instant Hero Cover Fly-In + Gentle Backdrop & Text Fade ---
 
-async function mountDetailView(container, { id }, { isPop = false, forceRefresh = false } = {}) {
+async function mountDetailView(container, { id }, { isPop = false, forceRefresh = false, signal = null } = {}) {
   const cleanups = [];
   const abortController = new AbortController();
+  if (signal) {
+    if (signal.aborted) return () => {};
+    const onAbort = () => abortController.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    cleanups.push(() => signal.removeEventListener('abort', onAbort));
+  }
   let downloadAbort = null;
   cleanups.push(() => abortController.abort());
   cleanups.push(() => downloadAbort?.abort());
@@ -1349,6 +1364,7 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
 
   const cachedBook = !forceRefresh ? bookMemoryCache.get(numId) : null;
   let meta = await getMetadata(id);
+  if (abortController.signal.aborted) return () => cleanups.forEach((fn) => fn());
   let book = cachedBook?.pages?.length
     ? cachedBook
     : hero?.book || cachedBook || meta?.bookJson || null;
@@ -1548,6 +1564,236 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
     readCtaLabel
   );
 
+  // --- Pre-Read AI Translation Panel ("khi chưa vô truyện nhấn nút dịch, xong mới vô coi") ---
+  let translateAbort = null;
+  let translating = false;
+  let workerStatus = { online: false, worker: null };
+  let translatedStats = { done: 0, total: book.pages?.length || 0 };
+  cleanups.push(() => translateAbort?.abort());
+
+  const detectedLang = detectBookLanguage(book);
+  const langSelect = el(
+    'select',
+    { className: 'translate-lang-select', 'aria-label': 'Ngôn ngữ nguồn của truyện' },
+    ...[
+      { val: 'auto', text: 'Tự nhận diện' },
+      { val: 'ja', text: 'Tiếng Nhật (JA)' },
+      { val: 'en', text: 'Tiếng Anh (EN)' },
+      { val: 'zh', text: 'Tiếng Trung (ZH)' },
+      { val: 'ko', text: 'Tiếng Hàn (KO)' },
+    ].map((opt) => el('option', { value: opt.val, selected: opt.val === detectedLang.sourceLang }, opt.text))
+  );
+
+  const workerDotEl = el('span', { className: 'worker-status-dot', 'aria-hidden': 'true' });
+  const workerStatusText = el('span', { className: 'worker-status-text' }, 'Đang kiểm tra Laptop dịch...');
+  const workerCheckBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'worker-refresh-btn',
+      'aria-label': 'Kiểm tra kết nối Laptop dịch',
+      title: 'Kiểm tra kết nối Laptop dịch',
+      onClick: () => refreshTranslatePanel(true),
+    },
+    svgIcon('refresh', 15)
+  );
+
+  const translateBarFill = el('div', { className: 'translate-progress-fill' });
+  const translateProgressText = el('p', { className: 'translate-progress-label tabular-nums' });
+  const translateProgressWrap = el(
+    'div',
+    { className: 'translate-progress-wrap', hidden: true },
+    el('div', { className: 'translate-progress-track' }, translateBarFill),
+    translateProgressText
+  );
+
+  const translateActionsRow = el('div', { className: 'translate-actions-row' });
+
+  const translateCard = el(
+    'section',
+    { className: 'detail-translate-card detail-fade-in', style: { '--fade-delay': '220ms' } },
+    el(
+      'div',
+      { className: 'translate-card-head' },
+      el('div', { className: 'worker-status-pill' }, workerDotEl, workerStatusText, workerCheckBtn),
+      langSelect
+    ),
+    translateProgressWrap,
+    translateActionsRow
+  );
+
+  function renderTranslateActions() {
+    const isFullyDone = translatedStats.total > 0 && translatedStats.done >= translatedStats.total;
+    const isPartial = translatedStats.done > 0 && translatedStats.done < translatedStats.total;
+    workerDotEl.classList.toggle('is-online', workerStatus.online);
+    if (workerStatus.online) {
+      const gpuName = workerStatus.worker?.gpu || 'GPU';
+      const modelName = workerStatus.worker?.model || 'Gemini';
+      workerStatusText.textContent = `Laptop Online · ${gpuName} (${modelName})`;
+    } else {
+      workerStatusText.textContent = 'Laptop dịch Offline (đọc bản gốc)';
+    }
+
+    if (translating) {
+      translateProgressWrap.hidden = false;
+      translateActionsRow.replaceChildren(
+        el(
+          'button',
+          {
+            type: 'button',
+            className: 'btn btn-surface translate-cancel-btn',
+            onClick: () => translateAbort?.abort(),
+          },
+          svgIcon('close', 16),
+          'Hủy dịch'
+        )
+      );
+      return;
+    }
+
+    translateProgressWrap.hidden = true;
+    const buttons = [];
+
+    if (isFullyDone) {
+      buttons.push(
+        el(
+          'button',
+          {
+            type: 'button',
+            className: 'btn translate-read-vi-btn',
+            onClick: () => {
+              const startPage = Math.max(1, lastReadPage || 1);
+              openBookReader(book, startPage, startPage === 1 ? coverBox : null, { langMode: 'vi' });
+            },
+          },
+          svgIcon('translate', 17),
+          `ĐỌC BẢN DỊCH VI (${translatedStats.done}/${translatedStats.total})`
+        )
+      );
+      if (workerStatus.online) {
+        buttons.push(
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'btn btn-surface',
+              onClick: () => startPreReadTranslation(true),
+            },
+            'Dịch lại'
+          )
+        );
+      }
+    } else {
+      const label = isPartial
+        ? `Dịch tiếp sang Tiếng Việt (${translatedStats.done}/${translatedStats.total})`
+        : 'Dịch truyện sang Tiếng Việt (AI)';
+      buttons.push(
+        el(
+          'button',
+          {
+            type: 'button',
+            className: `btn translate-start-btn ${workerStatus.online ? 'is-ready' : ''}`.trim(),
+            onClick: () => startPreReadTranslation(false),
+          },
+          svgIcon('translate', 17),
+          label
+        )
+      );
+      if (isPartial) {
+        buttons.push(
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'btn btn-surface',
+              onClick: () => openBookReader(book, Math.max(1, lastReadPage || 1), coverBox, { langMode: 'vi' }),
+            },
+            `Xem ${translatedStats.done} trang đã dịch`
+          )
+        );
+      }
+    }
+
+    translateActionsRow.replaceChildren(...buttons);
+  }
+
+  async function refreshTranslatePanel(showFeedback = false) {
+    workerStatus = await fetchTranslateStatus(abortController.signal);
+    if (abortController.signal.aborted) return;
+    if (book?.pages?.length) {
+      translatedStats = await countTranslatedPages(book, 'vi');
+      const det = detectBookLanguage(book);
+      if (langSelect.value === 'auto' && det.sourceLang !== 'auto') {
+        langSelect.value = det.sourceLang;
+      }
+    }
+    renderTranslateActions();
+    if (showFeedback) {
+      showToast(
+        workerStatus.online
+          ? `Đã kết nối Laptop dịch (${workerStatus.worker?.gpu || 'GPU'}).`
+          : 'Laptop dịch chưa kết nối. Hãy mở worker/run.sh trên laptop.'
+      );
+    }
+  }
+
+  async function startPreReadTranslation(force = false) {
+    if (translating) return;
+    // Re-check live worker connection right before starting
+    workerStatus = await fetchTranslateStatus(abortController.signal);
+    renderTranslateActions();
+    if (!workerStatus.online) {
+      showToast('Laptop dịch đang Offline. Chạy worker trên laptop rồi bấm kiểm tra lại nhé!', 'error');
+      return;
+    }
+    if (!book?.pages?.length) {
+      showToast('Đang tải thông tin trang truyện, thử lại sau 1 giây.');
+      return;
+    }
+
+    translating = true;
+    translateAbort = new AbortController();
+    const total = book.pages.length;
+    translateBarFill.style.width = '4%';
+    translateProgressText.textContent = `Đang gửi trang 1 / ${total} xuống Laptop GPU...`;
+    renderTranslateActions();
+
+    try {
+      if (force) await clearBookTranslation(book, 'vi');
+      await translateBookPages(book, {
+        sourceLang: langSelect.value || 'auto',
+        targetLang: 'vi',
+        force,
+        signal: translateAbort.signal,
+        onProgress: (done, tot, metaInfo) => {
+          translatedStats = { done, total: tot };
+          const pct = Math.round((done / Math.max(1, tot)) * 100);
+          translateBarFill.style.width = `${pct}%`;
+          const modelNote = metaInfo?.model ? ` · ${metaInfo.model}` : '';
+          translateProgressText.textContent = `Đã dịch ${done} / ${tot} trang (${pct}%)${modelNote}`;
+        },
+      });
+      translating = false;
+      translateAbort = null;
+      translatedStats = await countTranslatedPages(book, 'vi');
+      renderTranslateActions();
+      showToast(`Dịch xong ${translatedStats.done}/${translatedStats.total} trang! Đang mở bản Tiếng Việt...`, 'success');
+      // Auto-open Reader in Vietnamese once translation finishes!
+      const startPage = Math.max(1, lastReadPage || 1);
+      openBookReader(book, startPage, startPage === 1 ? coverBox : null, { langMode: 'vi' });
+    } catch (err) {
+      translating = false;
+      translateAbort = null;
+      translatedStats = await countTranslatedPages(book, 'vi');
+      renderTranslateActions();
+      if (err.name === 'AbortError') {
+        showToast(`Đã hủy dịch (đã lưu ${translatedStats.done}/${total} trang).`);
+      } else {
+        showToast(err.message || 'Lỗi dịch truyện.', 'error');
+      }
+    }
+  }
+
   const tagsHost = el('div', { className: 'detail-slot detail-fade-in', style: { '--fade-delay': '240ms' } });
   const previewHost = el('div', { className: 'detail-slot detail-fade-in', style: { '--fade-delay': '280ms' } });
   const relatedSection = el('section', { className: 'detail-section detail-fade-in', style: { '--fade-delay': '320ms' } });
@@ -1659,12 +1905,14 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
       { className: 'page-container detail-body-container' },
       heroRow,
       readCtaBtn,
+      translateCard,
       downloadStatusEl,
       tagsHost,
       previewHost,
       relatedSection
     )
   );
+  refreshTranslatePanel(false);
 
   // Run GPU-composited Menu Cover -> Detail Cover flight immediately using already-decoded cover
   if (hero?.fromRect && hero.imgSrc) {
@@ -1697,6 +1945,7 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
         readCtaLabel.textContent = lastReadPage > 0 ? `CONTINUE READING (PG ${lastReadPage})` : 'READ NOW';
         renderStats(fullBook);
         renderFullSections(fullBook);
+        refreshTranslatePanel(false);
       })
       .catch(() => {
         if (abortController.signal.aborted) return;
@@ -1776,6 +2025,16 @@ function renderDrawerInstallControl() {
 // --- Router Dispatcher ---
 
 async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
+  const mySeq = ++routeSeq;
+  routeAbortController?.abort();
+  routeAbortController = new AbortController();
+  const routeSignal = routeAbortController.signal;
+
+  if (isPop) {
+    closeMobileDrawer();
+    if (appSheet?.open) closeTopLayer(appSheet);
+  }
+
   if (typeof activeCleanup === 'function') {
     activeCleanup();
     activeCleanup = null;
@@ -1798,17 +2057,19 @@ async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
   syncHeaderChromeFn?.();
 
   await refreshLibraryStats();
+  if (mySeq !== routeSeq) return;
 
+  let nextCleanup = null;
   if (route.name === 'home') {
     if (forceRefresh) homeCache = null;
-    activeCleanup = await mountHomeView(appMain, { restoreCache: isPop, forceRefresh });
+    nextCleanup = await mountHomeView(appMain, { restoreCache: isPop, forceRefresh });
   } else if (route.name === 'search') {
     if (forceRefresh) searchCache.delete(`${route.params.q || ''}|${route.params.sort || 'popular'}`);
-    activeCleanup = await mountSearchView(appMain, route.params, { restoreCache: isPop, forceRefresh });
+    nextCleanup = await mountSearchView(appMain, route.params, { restoreCache: isPop, forceRefresh });
   } else if (route.name === 'favorites' || route.name === 'history' || route.name === 'downloads') {
-    activeCleanup = await mountCollectionView(appMain, route.name);
+    nextCleanup = await mountCollectionView(appMain, route.name);
   } else if (route.name === 'detail') {
-    activeCleanup = await mountDetailView(appMain, route.params, { isPop, forceRefresh });
+    nextCleanup = await mountDetailView(appMain, route.params, { isPop, forceRefresh, signal: routeSignal });
   } else if (route.name === 'reader') {
     const numId = Number(route.params.id);
     const readerHero =
@@ -1822,12 +2083,22 @@ async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
     const initialBook = readerHero?.book?.pages?.length
       ? readerHero.book
       : bookMemoryCache.get(numId) || null;
-    activeCleanup = await mountReaderView(appMain, route.params, navigate, {
+    const langMode = pendingReaderLangMode || 'auto';
+    pendingReaderLangMode = 'auto';
+    nextCleanup = await mountReaderView(appMain, route.params, navigate, {
       initialBook,
       heroTransition: readerHero,
       goBack,
+      langMode,
+      signal: routeSignal,
     });
   }
+
+  if (mySeq !== routeSeq) {
+    if (typeof nextCleanup === 'function') nextCleanup();
+    return;
+  }
+  activeCleanup = nextCleanup;
 
   // Deterministically restore exact scroll position when going Back (Menu / Tag / Detail)
   if (isPop && route.name !== 'reader') {
@@ -1843,7 +2114,7 @@ async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
   }
 }
 
-// --- Native Rubber-Band Pull-to-Refresh (List & Detail screens, disabled in Reader) ---
+// --- Native Rubber-Band Pull-to-Refresh (Menu/List screens only, disabled in Detail & Reader) ---
 
 function wirePullToRefresh() {
   const ptrIcon = el('span', { className: 'ptr-icon', 'aria-hidden': 'true' }, svgIcon('refresh', 17));
@@ -1871,7 +2142,12 @@ function wirePullToRefresh() {
     'touchstart',
     (e) => {
       if (refreshing || !e.touches || e.touches.length !== 1) return;
-      if (appShell.classList.contains('is-reader-route') || appSheet.open || appShell.classList.contains('drawer-open')) return;
+      if (
+        appShell.classList.contains('is-reader-route') ||
+        appShell.classList.contains('is-detail-route') ||
+        appSheet.open ||
+        appShell.classList.contains('drawer-open')
+      ) return;
       if (e.touches[0].clientX <= 24) return; // Reserve left edge strictly for Back swipe
       if (e.target.closest('.carousel-track, .weekly-track, input, textarea, select')) return;
       if (getScrollTop() > 2) return;
