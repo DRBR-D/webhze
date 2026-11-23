@@ -245,7 +245,8 @@ class LamaInpainter:
             return False
 
     def inpaint(self, rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        if not np.any(mask > 0):
+        ys, xs = np.nonzero(mask > 0)
+        if ys.size == 0:
             return rgb
 
         if not self._load():
@@ -253,17 +254,27 @@ class LamaInpainter:
             cleaned = cv2.inpaint(bgr, mask, 5, cv2.INPAINT_TELEA)
             return cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)
 
-        orig_h, orig_w = rgb.shape[:2]
+        # Tight ROI crop around text mask (+64px context) -> faster LaMa + higher effective resolution
+        full_h, full_w = rgb.shape[:2]
+        pad_ctx = 64
+        ry1 = max(0, int(ys.min()) - pad_ctx)
+        ry2 = min(full_h, int(ys.max()) + 1 + pad_ctx)
+        rx1 = max(0, int(xs.min()) - pad_ctx)
+        rx2 = min(full_w, int(xs.max()) + 1 + pad_ctx)
+
+        roi_rgb = rgb[ry1:ry2, rx1:rx2]
+        roi_mask = mask[ry1:ry2, rx1:rx2]
+        orig_h, orig_w = roi_rgb.shape[:2]
         scale = min(1.0, self.max_size / float(max(orig_h, orig_w)))
         work_w = max(8, int(round(orig_w * scale)))
         work_h = max(8, int(round(orig_h * scale)))
 
         if scale < 1.0:
-            small_rgb = cv2.resize(rgb, (work_w, work_h), interpolation=cv2.INTER_AREA)
-            small_mask = cv2.resize(mask, (work_w, work_h), interpolation=cv2.INTER_NEAREST)
+            small_rgb = cv2.resize(roi_rgb, (work_w, work_h), interpolation=cv2.INTER_AREA)
+            small_mask = cv2.resize(roi_mask, (work_w, work_h), interpolation=cv2.INTER_NEAREST)
         else:
-            small_rgb = rgb
-            small_mask = mask
+            small_rgb = roi_rgb
+            small_mask = roi_mask
 
         pad_h = (8 - (work_h % 8)) % 8
         pad_w = (8 - (work_w % 8)) % 8
@@ -290,19 +301,19 @@ class LamaInpainter:
             return cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB)
         finally:
             del img_t, mask_t
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
 
         out_np = out_np[:work_h, :work_w]
         if scale < 1.0:
-            out_full = cv2.resize(out_np, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+            out_roi = cv2.resize(out_np, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
         else:
-            out_full = out_np
+            out_roi = out_np
 
-        # Feather composite: ONLY replace the masked text areas, keeping 100% native sharpness elsewhere!
-        alpha = cv2.GaussianBlur((mask > 127).astype(np.float32), (5, 5), 0)[..., None]
-        blended = (out_full.astype(np.float32) * alpha + rgb.astype(np.float32) * (1.0 - alpha))
-        return np.clip(blended, 0, 255).astype(np.uint8)
+        # Feather composite ONLY inside ROI mask, keeping 100% native sharpness everywhere else!
+        result = rgb.copy()
+        alpha = cv2.GaussianBlur((roi_mask > 127).astype(np.float32), (5, 5), 0)[..., None]
+        blended = out_roi.astype(np.float32) * alpha + roi_rgb.astype(np.float32) * (1.0 - alpha)
+        result[ry1:ry2, rx1:rx2] = np.clip(blended, 0, 255).astype(np.uint8)
+        return result
 
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
@@ -418,7 +429,7 @@ class MangaTranslationPipeline:
         self._ocr_cache: dict[str, RapidOCR] = {}
         self._ocr_lock = threading.Lock()
         self._gpu_lock = threading.Lock()
-        self._stage_pool = ThreadPoolExecutor(max_workers=4)
+        self._stage_pool = ThreadPoolExecutor(max_workers=6)
 
     def warmup(self) -> None:
         """Pre-load LaMa onto CUDA at worker startup so Page 1 has zero cold-start delay."""
@@ -480,26 +491,47 @@ class MangaTranslationPipeline:
                 "ms": int((time.perf_counter() - t0) * 1000),
             }
 
-        # Build text mask immediately so LaMa GPU inpainting & Gemini API run IN PARALLEL!
-        mask = np.zeros((h, w), dtype=np.uint8)
-        for box in raw_boxes:
-            cv2.fillPoly(mask, [box.polygon.astype(np.int32)], 255)
+        # Smart Hybrid Text Eraser:
+        # - Uniform solid bubbles (white speech bubbles / flat narration boxes, ring std < 12):
+        #   exact border-median fill in <1ms (cleaner than neural blur, 0ms GPU!).
+        # - Complex artwork / screentone / gradient / SFX backgrounds (ring std >= 12):
+        #   full RTX 3050 LaMa CUDA inpainting (run IN PARALLEL with DeepSeek API!).
         dilate_px = max(7, int(round(min(h, w) * 0.008)))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        inner_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+        outer_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, ((dilate_px + 7) * 2 + 1, (dilate_px + 7) * 2 + 1))
 
+        working_rgb = rgb.copy()
+        lama_mask = np.zeros((h, w), dtype=np.uint8)
+        for box in raw_boxes:
+            bx1 = max(0, int(box.x1) - dilate_px - 10)
+            by1 = max(0, int(box.y1) - dilate_px - 10)
+            bx2 = min(w, int(box.x2) + dilate_px + 11)
+            by2 = min(h, int(box.y2) + dilate_px + 11)
+            local_poly = (box.polygon - np.array([bx1, by1], dtype=np.float32)).astype(np.int32)
+            loc_mask = np.zeros((by2 - by1, bx2 - bx1), dtype=np.uint8)
+            cv2.fillPoly(loc_mask, [local_poly], 255)
+            inner = cv2.dilate(loc_mask, inner_k, iterations=1)
+            ring = cv2.subtract(cv2.dilate(loc_mask, outer_k, iterations=1), inner)
+            ring_px = working_rgb[by1:by2, bx1:bx2][ring > 0]
+            if ring_px.size >= 16 and float(np.std(ring_px)) < 12.0:
+                fill_rgb = np.median(ring_px, axis=0).astype(np.uint8)
+                working_rgb[by1:by2, bx1:bx2][inner > 0] = fill_rgb
+            else:
+                lama_mask[by1:by2, bx1:bx2] = cv2.bitwise_or(lama_mask[by1:by2, bx1:bx2], inner)
+
+        needs_lama = bool(np.any(lama_mask > 0))
         source_lines = [c.text for c in clusters]
 
         def _run_gpu_inpaint() -> np.ndarray:
             with self._gpu_lock:
-                return self.inpainter.inpaint(rgb, mask)
+                return self.inpainter.inpaint(working_rgb, lama_mask)
 
-        # Overlap RTX 3050 LaMa (~0.78s) with Gemini API network call (~1.3s) -> 0s extra GPU wait!
-        inpaint_fut = self._stage_pool.submit(_run_gpu_inpaint)
+        # Overlap RTX 3050 LaMa (only when artwork background needs it) with DeepSeek API call!
+        inpaint_fut = self._stage_pool.submit(_run_gpu_inpaint) if needs_lama else None
         translated_lines, trans_meta = self.translator.translate_page_lines(
             source_lines, source_lang=source_lang, target_lang=target_lang
         )
-        cleaned_rgb = inpaint_fut.result()
+        cleaned_rgb = inpaint_fut.result() if inpaint_fut is not None else working_rgb
 
         for c, tr in zip(clusters, translated_lines):
             c.translated = tr

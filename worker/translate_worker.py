@@ -15,6 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from gemini_translator import GeminiMangaTranslator
 from image_pipeline import MangaTranslationPipeline
@@ -110,7 +111,7 @@ def run_worker_loop() -> None:
 
     print(f"=== MANGA GPU TRANSLATION WORKER ===", flush=True)
     print(f"Server : {server_url}", flush=True)
-    print(f"Device : {gpu_name} | Inpaint <= {pipeline.inpainter.max_size}px | Pipelined x2", flush=True)
+    print(f"Device : {gpu_name} | Inpaint <= {pipeline.inpainter.max_size}px | Turbo Pipelined x4", flush=True)
     print(f"Models : {' -> '.join(translator.models)}", flush=True)
     print(f"Font   : {pipeline.font_path or 'default'}", flush=True)
 
@@ -118,7 +119,12 @@ def run_worker_loop() -> None:
     pipeline.warmup()
 
     stream_sess = requests.Session()
-    job_pool = ThreadPoolExecutor(max_workers=2)
+    # Shared Keep-Alive pool across all 4 worker threads -> 0ms TLS handshake overhead per page!
+    job_sess = requests.Session()
+    pool_adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12)
+    job_sess.mount("https://", pool_adapter)
+    job_sess.mount("http://", pool_adapter)
+    job_pool = ThreadPoolExecutor(max_workers=4)
     backoff = 2.0
 
     while True:
@@ -153,7 +159,7 @@ def run_worker_loop() -> None:
                             payload_str = "\n".join(data_lines)
                             try:
                                 job = json.loads(payload_str)
-                                job_pool.submit(handle_job, server_url, token, pipeline, job)
+                                job_pool.submit(handle_job, job_sess, server_url, token, pipeline, job)
                             except Exception as exc:
                                 print(f"[Job Error] {exc}", flush=True)
                         event_name = None
@@ -176,12 +182,12 @@ def run_worker_loop() -> None:
 
 
 def handle_job(
+    session: requests.Session,
     server_url: str,
     token: str,
     pipeline: MangaTranslationPipeline,
     job: dict,
 ) -> None:
-    session = requests.Session()
     job_id = job["jobId"]
     book_id = job.get("bookId")
     page = job.get("page")

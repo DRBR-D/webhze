@@ -328,7 +328,7 @@ export async function translateSinglePage(
  */
 export async function translateBookPages(
   book,
-  { sourceLang = null, targetLang = 'vi', force = false, signal, onProgress, concurrency = 2 } = {}
+  { sourceLang = null, targetLang = 'vi', force = false, signal, onProgress, concurrency = 4 } = {}
 ) {
   const pages = book?.pages || [];
   if (!pages.length) throw new Error('Truyện chưa có dữ liệu trang để dịch.');

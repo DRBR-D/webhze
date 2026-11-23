@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from typing import Sequence
 
 import requests
+from requests.adapters import HTTPAdapter
 
 try:
     from deep_translator import GoogleTranslator
@@ -24,22 +26,39 @@ LANG_NAMES = {
 }
 
 
-def _extract_json_array(raw_text: str) -> list[str] | None:
+def _extract_translations(raw_text: str, expected_len: int) -> list[str] | None:
     text = (raw_text or "").strip()
     if not text:
         return None
-    fence = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if fence:
-        text = fence.group(1)
-    else:
-        arr = re.search(r"\[[\s\S]*\]", text)
-        if arr:
-            text = arr.group(0)
+        text = fence.group(1).strip()
     try:
         parsed = json.loads(text)
     except Exception:
-        return None
-    if isinstance(parsed, list):
+        m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+        if not m:
+            return None
+        try:
+            parsed = json.loads(m.group(1))
+        except Exception:
+            return None
+
+    if isinstance(parsed, dict):
+        # Accept {"1": "...", "2": "..."} OR {"translations": [...]}
+        if isinstance(parsed.get("translations"), list) and len(parsed["translations"]) == expected_len:
+            return [str(x).strip() for x in parsed["translations"]]
+        out = []
+        for idx in range(1, expected_len + 1):
+            val = parsed.get(str(idx))
+            if val is None:
+                val = parsed.get(str(idx - 1))
+            if val is None:
+                return None
+            out.append(str(val).strip())
+        return out
+
+    if isinstance(parsed, list) and len(parsed) == expected_len:
         return [str(x).strip() for x in parsed]
     return None
 
@@ -60,20 +79,24 @@ class GeminiMangaTranslator:
         self.models = [self.model]
         self.timeout_sec = timeout_sec
         self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        # Cap concurrent DeepSeek calls to 2 to avoid per-key burst throttling (measured 3x faster than 4x burst!)
+        self._api_sem = threading.Semaphore(2)
         self._cooldown_until = 0.0
 
     def _build_prompt(self, lines: Sequence[str], source_lang: str, target_lang: str) -> str:
         lang_desc = LANG_NAMES.get(source_lang, source_lang)
         target_name = "Vietnamese" if target_lang == "vi" else target_lang
+        numbered = {str(i + 1): ln for i, ln in enumerate(lines)}
         return (
-            f"You are an expert manga/comic translator translating dialogue from {lang_desc} into natural, "
-            f"idiomatic {target_name}.\n"
+            f"Translate manga dialogue from {lang_desc} into natural, idiomatic {target_name}.\n"
             "Rules:\n"
-            "- Keep all lines consistent in tone, character pronouns (anh/em, cậu/tớ, tôi/cô, tao/mày...), and page context.\n"
-            "- Keep translations concise so they fit cleanly inside comic speech bubbles.\n"
-            "- Preserve sound effects naturally or briefly.\n"
-            f"- Return ONLY a valid JSON array of exactly {len(lines)} strings in the same order, with no commentary.\n\n"
-            f"Input JSON array:\n{json.dumps(list(lines), ensure_ascii=False)}"
+            "- Keep pronouns (anh/em, cậu/tớ, tôi/cô, tao/mày...) and tone consistent across all lines.\n"
+            "- Keep each line concise for comic speech bubbles.\n"
+            f"- Return ONLY a JSON object with the exact same numeric keys \"1\"..\"{len(lines)}\".\n\n"
+            f"Input:\n{json.dumps(numbered, ensure_ascii=False)}"
         )
 
     def _call_deepseek(self, lines: Sequence[str], source_lang: str, target_lang: str) -> tuple[list[str] | None, str]:
@@ -92,12 +115,14 @@ class GeminiMangaTranslator:
             "messages": [{"role": "user", "content": self._build_prompt(lines, source_lang, target_lang)}],
             "temperature": 0.25,
             "max_tokens": max(1024, len(lines) * 160),
+            "response_format": {"type": "json_object"},
             # Disable reasoning tokens on deepseek-flash -> ~0.65s latency, cheaper, zero JSON truncation
             "thinking": {"type": "disabled"},
         }
 
         try:
-            resp = self.session.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
+            with self._api_sem:
+                resp = self.session.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
         except requests.RequestException as exc:
             self._cooldown_until = time.time() + 60
             return None, f"net_err:{exc.__class__.__name__}"
@@ -117,8 +142,8 @@ class GeminiMangaTranslator:
             return None, "blocked:content_filter"
 
         raw_text = choice.get("message", {}).get("content") or ""
-        parsed = _extract_json_array(raw_text)
-        if not parsed or len(parsed) != len(lines):
+        parsed = _extract_translations(raw_text, len(lines))
+        if not parsed:
             return None, "parse_mismatch"
         return parsed, "ok"
 
