@@ -1858,6 +1858,12 @@ button:disabled {
 .reader-shell[data-reader-theme="sepia"]    { --reader-bg: #F4ECD8; --reader-fg: #2B2118; }
 .reader-shell[data-reader-theme="white"]    { --reader-bg: #FFFFFF; --reader-fg: #14141B; }
 
+.reader-shell[data-reader-theme="sepia"] .glass-clear,
+.reader-shell[data-reader-theme="white"] .glass-clear {
+  background-color: rgba(20, 20, 30, 0.56);
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
 .reader-top-bar,
 .reader-bottom-bar {
   position: fixed;
@@ -2222,7 +2228,7 @@ dialog::backdrop {
 .sheet-done-btn:active { transform: scale(0.95); }
 
 .dialog-body {
-  padding: 1rem 1.15rem 1.35rem;
+  padding: 1rem 1.15rem max(1.65rem, calc(1rem + env(safe-area-inset-bottom, 0px)));
   display: flex;
   flex-direction: column;
   gap: 1.15rem;
