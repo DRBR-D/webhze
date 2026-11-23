@@ -1,0 +1,13 @@
+{
+  "name": "webhen-manga-reader",
+  "version": "1.0.0",
+  "description": "Responsive Manga Reader Web App (4.8in phones to PC) built from lưu ý.md spec",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/app.test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

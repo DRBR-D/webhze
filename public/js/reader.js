@@ -1,0 +1,829 @@
+import {
+  fetchBook,
+  fullImageUrl,
+  proxyImageUrl,
+  getBookTitle,
+  getCachedImageObjectUrl,
+} from './api.js';
+import {
+  getMetadata,
+  updateHistory,
+  loadReaderPrefs,
+  saveReaderPrefs,
+} from './store.js';
+import {
+  el,
+  svgIcon,
+  wireDialogLightDismiss,
+  revokeObjectUrls,
+  showToast,
+} from './dom.js';
+
+const READER_THEMES = [
+  { id: 'black', label: 'Đen tuyền', color: '#000000' },
+  { id: 'charcoal', label: 'Than chì', color: '#14141A' },
+  { id: 'sepia', label: 'Giấy cũ', color: '#F4ECD8' },
+  { id: 'white', label: 'Trắng sáng', color: '#FFFFFF' },
+];
+
+function createPageImg(page, mediaId, priority = 'lazy') {
+  const remoteUrl = fullImageUrl(page.path, mediaId);
+  const img = document.createElement('img');
+  img.alt = `Trang ${page.number}`;
+  img.className = 'reader-page-img';
+  img.referrerPolicy = 'no-referrer';
+  img.decoding = 'async';
+  img.draggable = false;
+  if (page.width && page.height) {
+    img.width = page.width;
+    img.height = page.height;
+    img.style.aspectRatio = `${page.width} / ${page.height}`;
+  }
+  if (priority === 'high') {
+    img.setAttribute('fetchpriority', 'high');
+  } else if (priority === 'lazy') {
+    img.loading = 'lazy';
+  }
+
+  let triedProxy = false;
+  img.addEventListener('error', () => {
+    if (!triedProxy && remoteUrl) {
+      triedProxy = true;
+      img.src = proxyImageUrl(remoteUrl);
+    } else {
+      img.classList.add('img-error');
+    }
+  });
+
+  if (remoteUrl) {
+    getCachedImageObjectUrl(remoteUrl).then((objUrl) => {
+      if (objUrl) {
+        img.dataset.objectUrl = objUrl;
+        img.src = objUrl;
+      }
+    });
+    img.src = remoteUrl;
+  }
+  return img;
+}
+
+export async function mountReaderView(container, { id, page: initialPage }, navigate) {
+  const cleanups = [];
+  const abortController = new AbortController();
+  cleanups.push(() => abortController.abort());
+
+  const prefs = loadReaderPrefs();
+  let mode = prefs.mode; // 'horizontal' | 'vertical'
+  let theme = prefs.theme; // 'black' | 'charcoal' | 'sepia' | 'white'
+  let autoScrollSpeed = prefs.autoScrollSpeed;
+  let autoScrolling = false;
+  let hudVisible = true;
+  let zoom = 1;
+  let panX = 0;
+  let panY = 0;
+  let currentPage = Math.max(1, Number(initialPage) || 1);
+  let book = null;
+  let totalPages = 0;
+
+  let rafId = 0;
+  let lastFrameTs = 0;
+  let horizAutoTimer = 0;
+  let observer = null;
+
+  const root = el('div', {
+    className: 'reader-shell',
+    dataset: { readerTheme: theme, mode },
+  });
+  container.replaceChildren(root);
+
+  const loadingBox = el(
+    'div',
+    { className: 'reader-status-box' },
+    el('div', { className: 'spinner', 'aria-hidden': 'true' }),
+    el('p', {}, 'Đang tải trang truyện...')
+  );
+  root.appendChild(loadingBox);
+
+  // Load cached book first for instant offline reading, otherwise fetch from proxy
+  try {
+    const meta = await getMetadata(id);
+    if (meta?.bookJson?.pages?.length) {
+      book = meta.bookJson;
+    } else {
+      book = await fetchBook(id, abortController.signal);
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') return () => {};
+    root.replaceChildren(
+      el(
+        'div',
+        { className: 'reader-status-box error-panel' },
+        el('h2', {}, 'Không tải được chương truyện'),
+        el('p', {}, err.message),
+        err.hint ? el('p', { className: 'muted-hint' }, err.hint) : null,
+        el(
+          'div',
+          { className: 'btn-row' },
+          el(
+            'button',
+            { type: 'button', className: 'btn btn-primary', onClick: () => navigate(`/read/${id}/${currentPage}`, { replace: true }) },
+            'Thử lại'
+          ),
+          el(
+            'button',
+            { type: 'button', className: 'btn btn-ghost', onClick: () => navigate(`/manga/${id}`) },
+            'Về trang chi tiết'
+          )
+        )
+      )
+    );
+    return () => cleanups.forEach((fn) => fn());
+  }
+
+  const pages = book?.pages || [];
+  totalPages = pages.length || book?.num_pages || 0;
+  if (!pages.length) {
+    root.replaceChildren(
+      el(
+        'div',
+        { className: 'reader-status-box' },
+        el('p', {}, 'Truyện này chưa có dữ liệu trang ảnh.'),
+        el('button', { type: 'button', className: 'btn btn-primary', onClick: () => navigate(`/manga/${id}`) }, 'Quay lại')
+      )
+    );
+    return () => cleanups.forEach((fn) => fn());
+  }
+
+  currentPage = Math.min(totalPages, Math.max(1, currentPage));
+  const titleText = getBookTitle(book);
+
+  // Build UI elements
+  const pageCounterText = el('span', { className: 'reader-counter' }, `Trang ${currentPage} / ${totalPages}`);
+  const modeToggleBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'icon-btn reader-hud-btn',
+      'aria-label': 'Đổi chế độ đọc ngang hoặc dọc',
+      title: 'Đổi chế độ đọc',
+      onClick: () => setMode(mode === 'vertical' ? 'horizontal' : 'vertical'),
+    },
+    svgIcon(mode === 'vertical' ? 'vertical' : 'horizontal', 20)
+  );
+
+  const settingsDialog = buildSettingsDialog();
+  wireDialogLightDismiss(settingsDialog);
+
+  const topBar = el(
+    'header',
+    { className: 'reader-top-bar' },
+    el(
+      'button',
+      {
+        type: 'button',
+        className: 'icon-btn reader-hud-btn',
+        'aria-label': 'Quay lại chi tiết truyện',
+        onClick: () => navigate(`/manga/${id}`),
+      },
+      svgIcon('back', 20)
+    ),
+    el(
+      'div',
+      { className: 'reader-title-wrap' },
+      el('h1', { className: 'reader-title' }, titleText),
+      pageCounterText
+    ),
+    el(
+      'div',
+      { className: 'reader-top-actions' },
+      modeToggleBtn,
+      el(
+        'button',
+        {
+          type: 'button',
+          className: 'icon-btn reader-hud-btn',
+          'aria-label': 'Cài đặt đọc truyện',
+          onClick: () => settingsDialog.showModal(),
+        },
+        svgIcon('settings', 20)
+      )
+    )
+  );
+
+  const pageSlider = el('input', {
+    type: 'range',
+    className: 'reader-slider',
+    min: '1',
+    max: String(totalPages),
+    value: String(currentPage),
+    'aria-label': 'Chuyển nhanh đến trang',
+    onInput: (e) => goToPage(Number(e.target.value)),
+  });
+
+  const autoScrollBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'pill-btn reader-hud-chip',
+      'aria-pressed': 'false',
+      onClick: () => setAutoScrolling(!autoScrolling),
+    },
+    svgIcon('play', 16),
+    el('span', {}, 'Tự cuộn')
+  );
+
+  const zoomResetBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'pill-btn reader-hud-chip',
+      'aria-label': 'Đặt lại mức thu phóng 100%',
+      onClick: () => setZoom(1),
+    },
+    '100%'
+  );
+
+  const prevPageBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'icon-btn reader-hud-btn',
+      'aria-label': 'Trang trước',
+      onClick: () => goToPage(currentPage - 1),
+    },
+    svgIcon('chevronLeft', 20)
+  );
+
+  const nextPageBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'icon-btn reader-hud-btn',
+      'aria-label': 'Trang tiếp theo',
+      onClick: () => goToPage(currentPage + 1),
+    },
+    svgIcon('chevronRight', 20)
+  );
+
+  const bottomBar = el(
+    'footer',
+    { className: 'reader-bottom-bar' },
+    el(
+      'div',
+      { className: 'reader-scrubber-row' },
+      prevPageBtn,
+      pageSlider,
+      nextPageBtn
+    ),
+    el(
+      'div',
+      { className: 'reader-tools-row' },
+      autoScrollBtn,
+      el(
+        'div',
+        { className: 'reader-zoom-group' },
+        el(
+          'button',
+          {
+            type: 'button',
+            className: 'icon-btn reader-hud-btn compact',
+            'aria-label': 'Thu nhỏ',
+            onClick: () => setZoom(zoom - 0.25),
+          },
+          svgIcon('zoomOut', 18)
+        ),
+        zoomResetBtn,
+        el(
+          'button',
+          {
+            type: 'button',
+            className: 'icon-btn reader-hud-btn compact',
+            'aria-label': 'Phóng to',
+            onClick: () => setZoom(zoom + 0.25),
+          },
+          svgIcon('zoomIn', 18)
+        )
+      )
+    )
+  );
+
+  const viewport = el('div', {
+    className: 'reader-viewport',
+    tabindex: '0',
+    'aria-label': 'Khung đọc truyện',
+  });
+
+  const stage = el('div', { className: 'reader-stage' });
+  viewport.appendChild(stage);
+
+  root.replaceChildren(topBar, viewport, bottomBar, settingsDialog);
+
+  function buildSettingsDialog() {
+    const modeButtons = [
+      { id: 'vertical', label: 'Cuộn dọc (Webtoon)' },
+      { id: 'horizontal', label: 'Lật trang ngang' },
+    ];
+
+    const speedValueLabel = el('strong', {}, `${autoScrollSpeed}x`);
+    const speedSlider = el('input', {
+      type: 'range',
+      min: '1',
+      max: '10',
+      step: '1',
+      value: String(autoScrollSpeed),
+      'aria-label': 'Tốc độ tự động cuộn',
+      onInput: (e) => {
+        autoScrollSpeed = Number(e.target.value);
+        speedValueLabel.textContent = `${autoScrollSpeed}x`;
+        saveReaderPrefs({ autoScrollSpeed });
+        if (autoScrolling && mode === 'horizontal') {
+          restartHorizontalAutoTimer();
+        }
+      },
+    });
+
+    const dialog = el(
+      'dialog',
+      {
+        className: 'app-dialog reader-settings-dialog',
+        closedby: 'any',
+        'aria-labelledby': 'reader-settings-title',
+      },
+      el(
+        'div',
+        { className: 'dialog-header' },
+        el('h2', { id: 'reader-settings-title' }, 'Cài đặt đọc truyện'),
+        el(
+          'button',
+          {
+            type: 'button',
+            className: 'icon-btn',
+            'aria-label': 'Đóng cài đặt',
+            onClick: () => dialog.close(),
+          },
+          svgIcon('close', 20)
+        )
+      ),
+      el(
+        'div',
+        { className: 'dialog-body' },
+        el(
+          'div',
+          { className: 'setting-group' },
+          el('span', { className: 'setting-label' }, 'Chế độ đọc'),
+          el(
+            'div',
+            { className: 'segmented-row', dataset: { role: 'mode-group' } },
+            ...modeButtons.map((m) =>
+              el(
+                'button',
+                {
+                  type: 'button',
+                  className: `pill-btn seg-btn ${mode === m.id ? 'active' : ''}`,
+                  dataset: { modeVal: m.id },
+                  onClick: () => setMode(m.id),
+                },
+                m.label
+              )
+            )
+          )
+        ),
+        el(
+          'div',
+          { className: 'setting-group' },
+          el('span', { className: 'setting-label' }, 'Màu nền đọc'),
+          el(
+            'div',
+            { className: 'theme-swatch-grid', dataset: { role: 'theme-group' } },
+            ...READER_THEMES.map((t) =>
+              el(
+                'button',
+                {
+                  type: 'button',
+                  className: `theme-swatch-btn ${theme === t.id ? 'active' : ''}`,
+                  dataset: { themeVal: t.id },
+                  onClick: () => setTheme(t.id),
+                },
+                el('span', {
+                  className: 'theme-swatch-dot',
+                  style: { backgroundColor: t.color },
+                  'aria-hidden': 'true',
+                }),
+                el('span', {}, t.label)
+              )
+            )
+          )
+        ),
+        el(
+          'div',
+          { className: 'setting-group' },
+          el(
+            'div',
+            { className: 'setting-label-row' },
+            el('span', { className: 'setting-label' }, 'Tốc độ tự động cuộn'),
+            speedValueLabel
+          ),
+          speedSlider
+        ),
+        el(
+          'p',
+          { className: 'setting-hint' },
+          'Mẹo: Chạm giữa màn hình để ẩn/hiện thanh công cụ • Nhấp đúp hoặc chụm 2 ngón để phóng to • Phím ←/→ để chuyển trang trên PC.'
+        )
+      )
+    );
+    return dialog;
+  }
+
+  function syncSettingsDialogUI() {
+    for (const btn of settingsDialog.querySelectorAll('[data-mode-val]')) {
+      btn.classList.toggle('active', btn.dataset.modeVal === mode);
+    }
+    for (const btn of settingsDialog.querySelectorAll('[data-theme-val]')) {
+      btn.classList.toggle('active', btn.dataset.themeVal === theme);
+    }
+  }
+
+  function setHudVisible(visible) {
+    hudVisible = visible;
+    root.classList.toggle('hud-hidden', !hudVisible);
+  }
+
+  function setTheme(nextTheme) {
+    theme = nextTheme;
+    root.dataset.readerTheme = theme;
+    saveReaderPrefs({ theme });
+    syncSettingsDialogUI();
+  }
+
+  function applyTransform() {
+    if (zoom <= 1) {
+      panX = 0;
+      panY = 0;
+    }
+    stage.style.setProperty('--zoom', String(zoom));
+    stage.style.setProperty('--pan-x', `${panX}px`);
+    stage.style.setProperty('--pan-y', `${panY}px`);
+    viewport.classList.toggle('is-zoomed', zoom > 1);
+    zoomResetBtn.textContent = `${Math.round(zoom * 100)}%`;
+  }
+
+  function setZoom(nextZoom) {
+    zoom = Math.min(3.5, Math.max(1, Math.round(nextZoom * 100) / 100));
+    applyTransform();
+  }
+
+  function persistCurrentPage(pageNum) {
+    const clamped = Math.min(totalPages, Math.max(1, pageNum));
+    currentPage = clamped;
+    pageCounterText.textContent = `Trang ${currentPage} / ${totalPages}`;
+    pageSlider.value = String(currentPage);
+    prevPageBtn.disabled = currentPage <= 1;
+    nextPageBtn.disabled = currentPage >= totalPages;
+
+    const nextUrl = `/read/${id}/${currentPage}`;
+    if (window.location.pathname !== nextUrl) {
+      window.history.replaceState(null, '', nextUrl);
+    }
+    updateHistory(book, currentPage, totalPages).catch(() => {});
+    preloadAdjacentPages(currentPage);
+  }
+
+  const preloadedUrls = new Set();
+  function preloadAdjacentPages(pageNum) {
+    for (const offset of [1, 2]) {
+      const target = pages[pageNum - 1 + offset];
+      if (!target) continue;
+      const url = fullImageUrl(target.path, book.media_id);
+      if (!url || preloadedUrls.has(url)) continue;
+      preloadedUrls.add(url);
+      const preload = new Image();
+      preload.referrerPolicy = 'no-referrer';
+      preload.src = url;
+    }
+  }
+
+  function renderStage() {
+    observer?.disconnect();
+    observer = null;
+    revokeObjectUrls(stage);
+    stage.replaceChildren();
+    setZoom(1);
+    root.dataset.mode = mode;
+
+    modeToggleBtn.replaceChildren(svgIcon(mode === 'vertical' ? 'vertical' : 'horizontal', 20));
+    syncSettingsDialogUI();
+
+    if (mode === 'vertical') {
+      const list = el('div', { className: 'reader-vertical-list' });
+      pages.forEach((p, idx) => {
+        const pageNum = idx + 1;
+        const priority = Math.abs(pageNum - currentPage) <= 1 ? 'high' : 'lazy';
+        const fig = el(
+          'figure',
+          { className: 'reader-page-frame', dataset: { page: pageNum } },
+          createPageImg(p, book.media_id, priority),
+          el('figcaption', { className: 'reader-page-badge' }, `${pageNum} / ${totalPages}`)
+        );
+        list.appendChild(fig);
+      });
+      stage.appendChild(list);
+
+      // Jump to currentPage immediately after layout
+      requestAnimationFrame(() => {
+        const targetEl = list.querySelector(`[data-page="${currentPage}"]`);
+        if (targetEl) {
+          viewport.scrollTop = targetEl.offsetTop;
+        }
+      });
+
+      observer = new IntersectionObserver(
+        (entries) => {
+          let best = null;
+          for (const entry of entries) {
+            if (entry.isIntersecting && (!best || entry.intersectionRatio > best.intersectionRatio)) {
+              best = entry;
+            }
+          }
+          if (best) {
+            const pageNum = Number(best.target.dataset.page);
+            if (pageNum && pageNum !== currentPage) {
+              persistCurrentPage(pageNum);
+            }
+          }
+        },
+        { root: viewport, threshold: [0.25, 0.55] }
+      );
+      for (const frame of list.children) observer.observe(frame);
+    } else {
+      renderHorizontalPage();
+    }
+  }
+
+  function renderHorizontalPage() {
+    revokeObjectUrls(stage);
+    const p = pages[currentPage - 1];
+    if (!p) return;
+    const frame = el(
+      'div',
+      { className: 'reader-horizontal-frame' },
+      createPageImg(p, book.media_id, 'high')
+    );
+    stage.replaceChildren(frame);
+  }
+
+  function goToPage(targetPage) {
+    const clamped = Math.min(totalPages, Math.max(1, targetPage));
+    if (clamped === currentPage && mode === 'horizontal' && stage.children.length > 0) return;
+    persistCurrentPage(clamped);
+    if (mode === 'horizontal') {
+      setZoom(1);
+      renderHorizontalPage();
+    } else {
+      const targetEl = stage.querySelector(`[data-page="${clamped}"]`);
+      if (targetEl) {
+        viewport.scrollTo({ top: targetEl.offsetTop, behavior: 'auto' });
+      }
+    }
+  }
+
+  function setMode(nextMode) {
+    if (nextMode === mode) return;
+    setAutoScrolling(false);
+    mode = nextMode;
+    saveReaderPrefs({ mode });
+    renderStage();
+    showToast(mode === 'vertical' ? 'Chế độ cuộn dọc (Webtoon)' : 'Chế độ lật trang ngang');
+  }
+
+  // --- Auto-scroll loop ---
+  function stopAutoScrollLoops() {
+    cancelAnimationFrame(rafId);
+    rafId = 0;
+    clearInterval(horizAutoTimer);
+    horizAutoTimer = 0;
+  }
+
+  function restartHorizontalAutoTimer() {
+    clearInterval(horizAutoTimer);
+    const intervalMs = Math.max(1200, Math.round((8.8 - autoScrollSpeed * 0.72) * 1000));
+    horizAutoTimer = setInterval(() => {
+      if (!autoScrolling || mode !== 'horizontal') return;
+      if (currentPage >= totalPages) {
+        setAutoScrolling(false);
+        showToast('Đã đọc đến trang cuối cùng.');
+        return;
+      }
+      goToPage(currentPage + 1);
+    }, intervalMs);
+  }
+
+  function verticalAutoStep(ts) {
+    if (!autoScrolling || mode !== 'vertical') return;
+    if (!lastFrameTs) lastFrameTs = ts;
+    const dt = Math.min(0.08, (ts - lastFrameTs) / 1000);
+    lastFrameTs = ts;
+    const pxPerSec = autoScrollSpeed * 42;
+    const maxScroll = viewport.scrollHeight - viewport.clientHeight;
+    if (viewport.scrollTop >= maxScroll - 2) {
+      setAutoScrolling(false);
+      showToast('Đã cuộn đến hết truyện.');
+      return;
+    }
+    viewport.scrollTop += pxPerSec * dt;
+    rafId = requestAnimationFrame(verticalAutoStep);
+  }
+
+  function setAutoScrolling(active) {
+    autoScrolling = active;
+    stopAutoScrollLoops();
+    autoScrollBtn.setAttribute('aria-pressed', String(autoScrolling));
+    autoScrollBtn.classList.toggle('active', autoScrolling);
+    autoScrollBtn.replaceChildren(
+      svgIcon(autoScrolling ? 'pause' : 'play', 16),
+      el('span', {}, autoScrolling ? 'Dừng cuộn' : 'Tự cuộn')
+    );
+
+    if (!autoScrolling) return;
+    if (mode === 'vertical') {
+      lastFrameTs = 0;
+      rafId = requestAnimationFrame(verticalAutoStep);
+    } else {
+      restartHorizontalAutoTimer();
+    }
+  }
+
+  // --- Touch Gestures: Pinch-zoom, Pan, Swipe, Double-tap, Single-tap ---
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1;
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let touchStartPanX = 0;
+  let touchStartPanY = 0;
+  let touchMoved = false;
+  let lastTapTime = 0;
+  let tapTimer = 0;
+
+  function touchDist(t1, t2) {
+    return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+  }
+
+  function onTouchStart(e) {
+    if (e.touches.length === 2) {
+      pinchStartDist = touchDist(e.touches[0], e.touches[1]);
+      pinchStartZoom = zoom;
+      touchMoved = true;
+      return;
+    }
+    if (e.touches.length === 1) {
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      touchStartPanX = panX;
+      touchStartPanY = panY;
+      touchMoved = false;
+    }
+  }
+
+  function onTouchMove(e) {
+    if (e.touches.length === 2 && pinchStartDist > 0) {
+      e.preventDefault();
+      const ratio = touchDist(e.touches[0], e.touches[1]) / pinchStartDist;
+      setZoom(pinchStartZoom * ratio);
+      return;
+    }
+    if (e.touches.length === 1) {
+      const dx = e.touches[0].clientX - touchStartX;
+      const dy = e.touches[0].clientY - touchStartY;
+      if (Math.hypot(dx, dy) > 10) touchMoved = true;
+      if (zoom > 1) {
+        e.preventDefault();
+        const limitX = (viewport.clientWidth * (zoom - 1)) / 2;
+        const limitY = (viewport.clientHeight * (zoom - 1)) / 2;
+        panX = Math.max(-limitX, Math.min(limitX, touchStartPanX + dx));
+        panY = Math.max(-limitY, Math.min(limitY, touchStartPanY + dy));
+        applyTransform();
+      }
+    }
+  }
+
+  function onTouchEnd(e) {
+    if (e.touches.length < 2) pinchStartDist = 0;
+    if (e.changedTouches.length !== 1 || e.touches.length > 0) return;
+
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    const dy = e.changedTouches[0].clientY - touchStartY;
+
+    // Horizontal swipe to flip pages when not zoomed
+    if (mode === 'horizontal' && zoom <= 1 && Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.3) {
+      if (dx < 0) goToPage(currentPage + 1);
+      else goToPage(currentPage - 1);
+      return;
+    }
+
+    if (touchMoved) return;
+
+    const now = Date.now();
+    const tapX = e.changedTouches[0].clientX;
+    if (now - lastTapTime < 280) {
+      clearTimeout(tapTimer);
+      lastTapTime = 0;
+      setZoom(zoom > 1.1 ? 1 : 2);
+      return;
+    }
+    lastTapTime = now;
+    tapTimer = setTimeout(() => {
+      handleViewportTap(tapX);
+    }, 240);
+  }
+
+  function handleViewportTap(clientX) {
+    if (mode === 'horizontal' && zoom <= 1) {
+      const ratio = clientX / Math.max(1, viewport.clientWidth);
+      if (ratio < 0.25) {
+        goToPage(currentPage - 1);
+        return;
+      }
+      if (ratio > 0.75) {
+        goToPage(currentPage + 1);
+        return;
+      }
+    }
+    setHudVisible(!hudVisible);
+  }
+
+  // Desktop mouse interactions: click, double-click zoom, Ctrl+wheel zoom
+  let clickDelayTimer = 0;
+  function onViewportClick(e) {
+    // Touch taps already handled via onTouchEnd
+    if (e.pointerType === 'touch') return;
+    if (e.target.closest('button, input, dialog')) return;
+    if (e.detail >= 2) {
+      clearTimeout(clickDelayTimer);
+      setZoom(zoom > 1.1 ? 1 : 2);
+      return;
+    }
+    clearTimeout(clickDelayTimer);
+    const x = e.clientX;
+    clickDelayTimer = setTimeout(() => handleViewportTap(x), 180);
+  }
+
+  function onWheel(e) {
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      setZoom(zoom + (e.deltaY < 0 ? 0.2 : -0.2));
+    }
+  }
+
+  function onKeyDown(e) {
+    if (settingsDialog.open) return;
+    if (e.target.closest('input, textarea, select')) return;
+
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
+      e.preventDefault();
+      goToPage(currentPage + 1);
+    } else if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') {
+      e.preventDefault();
+      goToPage(currentPage - 1);
+    } else if (e.key === '+' || e.key === '=') {
+      e.preventDefault();
+      setZoom(zoom + 0.25);
+    } else if (e.key === '-') {
+      e.preventDefault();
+      setZoom(zoom - 0.25);
+    } else if (e.key === '0') {
+      e.preventDefault();
+      setZoom(1);
+    } else if (e.key === ' ') {
+      e.preventDefault();
+      setAutoScrolling(!autoScrolling);
+    } else if (e.key === 'h' || e.key === 'H') {
+      setHudVisible(!hudVisible);
+    }
+  }
+
+  viewport.addEventListener('touchstart', onTouchStart, { passive: true });
+  viewport.addEventListener('touchmove', onTouchMove, { passive: false });
+  viewport.addEventListener('touchend', onTouchEnd, { passive: true });
+  viewport.addEventListener('click', onViewportClick);
+  viewport.addEventListener('wheel', onWheel, { passive: false });
+  window.addEventListener('keydown', onKeyDown);
+
+  cleanups.push(() => {
+    stopAutoScrollLoops();
+    clearTimeout(tapTimer);
+    clearTimeout(clickDelayTimer);
+    observer?.disconnect();
+    viewport.removeEventListener('touchstart', onTouchStart);
+    viewport.removeEventListener('touchmove', onTouchMove);
+    viewport.removeEventListener('touchend', onTouchEnd);
+    viewport.removeEventListener('click', onViewportClick);
+    viewport.removeEventListener('wheel', onWheel);
+    window.removeEventListener('keydown', onKeyDown);
+    revokeObjectUrls(stage);
+  });
+
+  renderStage();
+  persistCurrentPage(currentPage);
+
+  return () => cleanups.forEach((fn) => fn());
+}

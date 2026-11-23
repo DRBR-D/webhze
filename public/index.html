@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <script>
+    try {
+      var s = localStorage.getItem('color-scheme');
+      if (s === 'light' || s === 'dark') {
+        document.querySelector('meta[name="color-scheme"]').content = s;
+      }
+    } catch (e) {}
+  </script>
+  <title>Manga Reader — Đọc truyện cho Điện thoại &amp; PC</title>
+  <meta name="description" content="Trình đọc truyện đa nền tảng tối ưu từ màn hình điện thoại 4.8 inch đến máy tính để bàn.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <div id="app-shell" class="app-shell">
+    <a href="#app-main" class="skip-link">Chuyển đến nội dung chính</a>
+
+    <header class="top-header">
+      <div class="top-header-inner">
+        <a href="/" class="brand-link" data-spa-link>
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span class="brand-name">Manga<span class="brand-accent">Flow</span></span>
+        </a>
+
+        <nav class="desktop-nav" aria-label="Điều hướng chính">
+          <a href="/" class="nav-pill" data-spa-link data-nav-route="home">Trang chủ</a>
+          <a href="/search" class="nav-pill" data-spa-link data-nav-route="search">Tìm kiếm</a>
+          <a href="/favorites" class="nav-pill" data-spa-link data-nav-route="favorites">Yêu thích</a>
+          <a href="/history" class="nav-pill" data-spa-link data-nav-route="history">Lịch sử</a>
+          <a href="/downloads" class="nav-pill" data-spa-link data-nav-route="downloads">Tải về</a>
+        </nav>
+
+        <div class="header-actions">
+          <button type="button" id="rewards-open-btn" class="pill-btn points-chip" aria-label="Điểm thưởng, điểm danh và cài đặt giao diện">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M20 7h-2.18A3 3 0 0 0 12 4.35 3 3 0 0 0 6.18 7H4a2 2 0 0 0-2 2v3h2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8h2V9a2 2 0 0 0-2-2Zm-5-2a1 1 0 1 1 0 2h-2V6a1 1 0 0 1 2-1ZM9 5a1 1 0 0 1 2 1v1H9a1 1 0 0 1 0-2Zm-3 15v-8h5v8H6Zm12 0h-5v-8h5v8Zm2-10H4V9h16v1Z"/></svg>
+            <span id="header-points-value">300</span>
+          </button>
+
+          <button type="button" id="theme-toggle-btn" class="icon-btn theme-toggle-btn">
+            <span class="theme-option theme-when-light">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1Z"/></svg>
+              <span class="visually-hidden">Chuyển sang giao diện tối</span>
+            </span>
+            <span class="theme-option theme-when-dark">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><path d="M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm0-5h-1v3h2V2h-1Zm0 17h-1v3h2v-3h-1ZM4.22 5.64 5.64 4.22 3.51 2.1 2.1 3.51l2.12 2.13Zm16.27 12.73-1.42 1.41 2.13 2.12 1.41-1.41-2.12-2.12ZM2 11v2h3v-2H2Zm17 0v2h3v-2h-3ZM4.22 18.36 2.1 20.49l1.41 1.41 2.13-2.12-1.42-1.42ZM19.78 5.64l2.12-2.13-1.41-1.41-2.13 2.12 1.42 1.42Z"/></svg>
+              <span class="visually-hidden">Chuyển sang giao diện sáng</span>
+            </span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main id="app-main" class="app-main" tabindex="-1"></main>
+
+    <nav class="mobile-bottom-nav" aria-label="Điều hướng di động">
+      <a href="/" class="bottom-nav-item" data-spa-link data-nav-route="home">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5.5v-6.5h-5V21H4a1 1 0 0 1-1-1z"/></svg>
+        <span>Trang chủ</span>
+      </a>
+      <a href="/search" class="bottom-nav-item" data-spa-link data-nav-route="search">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M10.5 3a7.5 7.5 0 1 0 4.65 13.38l4.74 4.74 1.41-1.41-4.74-4.74A7.5 7.5 0 0 0 10.5 3Zm0 2a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11Z"/></svg>
+        <span>Tìm kiếm</span>
+      </a>
+      <a href="/favorites" class="bottom-nav-item" data-spa-link data-nav-route="favorites">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M12 21.35 10.55 20.03C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35Z"/></svg>
+        <span>Yêu thích</span>
+      </a>
+      <a href="/history" class="bottom-nav-item" data-spa-link data-nav-route="history">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M13 3a9 9 0 1 0 8.95 10h-2.02A7 7 0 1 1 13 5c1.93 0 3.68.79 4.95 2.05L15 10h7V3l-2.64 2.64A8.96 8.96 0 0 0 13 3Zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12Z"/></svg>
+        <span>Lịch sử</span>
+      </a>
+      <a href="/downloads" class="bottom-nav-item" data-spa-link data-nav-route="downloads">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M5 20h14v-2H5v2Zm7-17v10.17l3.59-3.58L17 11l-5 5-5-5 1.41-1.41L11 13.17V3h1Z"/></svg>
+        <span>Tải về</span>
+      </a>
+    </nav>
+  </div>
+
+  <dialog id="rewards-dialog" class="app-dialog" closedby="any" aria-labelledby="rewards-dialog-title">
+    <div class="dialog-header">
+      <h2 id="rewards-dialog-title">Điểm danh, Quà tặng &amp; Giao diện</h2>
+      <button type="button" id="rewards-close-btn" class="icon-btn" aria-label="Đóng hộp thoại">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.71 2.88 18.3 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z"/></svg>
+      </button>
+    </div>
+    <div id="rewards-dialog-body" class="dialog-body"></div>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
