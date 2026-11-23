@@ -17,9 +17,6 @@ import {
   checkIn,
   redeemCode,
   spendPoints,
-  getStoredColorScheme,
-  getSystemColorScheme,
-  setColorSchemePreference,
   toggleColorScheme,
   initThemeSync,
   loadSidebarCollapsed,
@@ -42,7 +39,6 @@ import {
   wireIosSheet,
   closeTopLayer,
   formatNumber,
-  formatRelativeTime,
   formatUnixDate,
   showToast,
   parseRoute,
@@ -52,24 +48,35 @@ import { mountReaderView } from './reader.js';
 
 const QUICK_TAGS = ['english', 'full color', 'vanilla', 'romance', 'fantasy', 'schoolgirl'];
 
-const REWARD_SHOP = [
-  { name: 'THEME-PACK', label: 'Gói giao diện VIP', cost: 150 },
-  { name: 'BADGE-GOLD', label: 'Huy hiệu Độc giả Vàng', cost: 250 },
-  { name: 'OFFLINE-BOOST', label: 'Thẻ Ưu tiên Tải Offline', cost: 400 },
+const SHOP_ITEMS = [
+  { name: 'AD-FREE-DAY', label: 'Ad-Free Day', cost: 200 },
+  { name: 'VIP-EMBLEM', label: 'VIP Emblem', cost: 400 },
 ];
+
+const SORT_OPTIONS = [
+  { value: 'date', label: 'Mới nhất' },
+  { value: 'popular', label: 'Hot nhất' },
+  { value: 'popular-week', label: 'Hot tuần' },
+  { value: 'popular-today', label: 'Hot ngày' },
+];
+
+const TAG_DOT_COLORS = ['#FF5A36', '#FF4D8D', '#FFB347', '#38BDF8', '#34D399', '#A855F7'];
 
 let activeCleanup = null;
 let favoriteIdSet = new Set();
+let historyMap = new Map();
+let cachedPopularList = [];
 
 const appMain = document.getElementById('app-main');
 const appShell = document.getElementById('app-shell');
 const appStage = document.querySelector('.app-stage');
 const topHeader = document.getElementById('top-header');
 const toolbarTitleEl = document.getElementById('toolbar-title');
-const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
-const pointsBadge = document.getElementById('header-points-value');
-const rewardsDialog = document.getElementById('rewards-dialog');
-const rewardsDialogBody = document.getElementById('rewards-dialog-body');
+const navDrawer = document.getElementById('nav-drawer');
+const drawerScrim = document.getElementById('drawer-scrim');
+const appSheet = document.getElementById('app-sheet');
+const appSheetTitle = document.getElementById('app-sheet-title');
+const appSheetBody = document.getElementById('app-sheet-body');
 
 const supportsWebInstall = typeof Navigator !== 'undefined' && typeof Navigator.prototype?.install === 'function';
 let deferredInstallPrompt = null;
@@ -81,53 +88,75 @@ function isStandaloneMode() {
   );
 }
 
-const ROUTE_TITLES = {
-  home: 'Khám phá',
-  search: 'Tìm kiếm',
-  favorites: 'Yêu thích',
-  history: 'Lịch sử đọc',
-  downloads: 'Tải offline',
-  detail: 'Chi tiết truyện',
-  reader: 'Đang đọc',
-};
+// --- Drawer & Library Counters Sync ---
 
-function setToolbarTitle(text) {
-  if (toolbarTitleEl) toolbarTitleEl.textContent = text || 'MangaFlow';
+async function refreshLibraryStats() {
+  const [favs, hist, saved] = await Promise.all([getFavorites(), getHistory(), getDownloads()]);
+  favoriteIdSet = new Set(favs.map((f) => f.id));
+  historyMap = new Map(hist.map((h) => [h.id, h]));
+
+  const setCount = (id, n) => {
+    const node = document.getElementById(id);
+    if (!node) return;
+    node.textContent = String(n);
+    if (node.classList.contains('drawer-count-pill')) node.hidden = n === 0;
+  };
+  setCount('drawer-fav-count', favs.length);
+  setCount('drawer-history-count', hist.length);
+  setCount('drawer-saved-count', saved.length);
+  setCount('overview-fav-num', favs.length);
+  setCount('overview-history-num', hist.length);
+  setCount('overview-saved-num', saved.length);
+
+  const setDot = (id, show) => {
+    const d = document.getElementById(id);
+    if (d) d.hidden = !show;
+  };
+  setDot('tab-fav-dot', favs.length > 0);
+  setDot('tab-history-dot', hist.length > 0);
+  setDot('tab-saved-dot', saved.length > 0);
 }
 
-function setSidebarCollapsed(collapsed) {
-  appShell.classList.toggle('sidebar-collapsed', collapsed);
-  sidebarToggleBtn?.setAttribute('aria-expanded', String(!collapsed));
-  saveSidebarCollapsed(collapsed);
-}
-
-async function jumpToRandomManga() {
-  showToast('Đang chọn truyện ngẫu nhiên...');
-  try {
-    const randomBook = await fetchRandom();
-    if (randomBook?.id) {
-      await upsertMetadata(randomBook);
-      navigate(`/manga/${randomBook.id}`);
-    }
-  } catch (err) {
-    if (err.name !== 'AbortError') showToast(err.message || 'Không lấy được truyện ngẫu nhiên.', 'error');
+function updatePointsLabels() {
+  const { points } = loadUserState();
+  for (const node of document.querySelectorAll('[data-points-label]')) {
+    node.textContent = `${points} pts`;
   }
 }
 
-async function refreshFavoriteIds() {
-  const favs = await getFavorites();
-  favoriteIdSet = new Set(favs.map((f) => f.id));
+function openMobileDrawer() {
+  if (window.innerWidth >= 900) {
+    const collapsed = !appShell.classList.contains('sidebar-collapsed');
+    appShell.classList.toggle('sidebar-collapsed', collapsed);
+    saveSidebarCollapsed(collapsed);
+    return;
+  }
+  appShell.classList.add('drawer-open');
+  if (drawerScrim) drawerScrim.hidden = false;
 }
 
-function updateHeaderPoints() {
-  const state = loadUserState();
-  if (pointsBadge) pointsBadge.textContent = formatNumber(state.points);
+function closeMobileDrawer() {
+  appShell.classList.remove('drawer-open');
+  if (drawerScrim) drawerScrim.hidden = true;
 }
 
 function updateActiveNav(routeName) {
   const isReader = routeName === 'reader';
+  const isDetail = routeName === 'detail';
+  const isHome = routeName === 'home';
   appShell.classList.toggle('is-reader-route', isReader);
-  setToolbarTitle(ROUTE_TITLES[routeName] || 'MangaFlow');
+  appShell.classList.toggle('is-detail-route', isDetail);
+  appShell.classList.toggle('is-home-route', isHome);
+
+  if (toolbarTitleEl) {
+    toolbarTitleEl.textContent =
+      routeName === 'home' ? 'MANGA' :
+      routeName === 'search' ? 'Search' :
+      routeName === 'favorites' ? 'My Favorites' :
+      routeName === 'history' ? 'Reading History' :
+      routeName === 'downloads' ? 'Downloaded Books' :
+      'MANGA';
+  }
 
   for (const link of document.querySelectorAll('[data-nav-route]')) {
     const active = link.dataset.navRoute === routeName;
@@ -138,6 +167,7 @@ function updateActiveNav(routeName) {
 }
 
 export function navigate(url, { replace = false } = {}) {
+  closeMobileDrawer();
   const next = new URL(url, window.location.origin);
   const full = `${next.pathname}${next.search}`;
   if (full !== `${window.location.pathname}${window.location.search}`) {
@@ -147,54 +177,61 @@ export function navigate(url, { replace = false } = {}) {
   renderRoute();
 }
 
-// --- Shared Card & Error UI Builders ---
+// --- Shared Kinetic Manga Card & States ---
 
-function buildMangaCard(book, { meta = null, extraFooter = null, onCardOpen = null } = {}) {
+function buildMangaCard(book, { meta = null, progressBadge = null, onDelete = null } = {}) {
   const id = book.id;
   const title = getBookTitle(book);
   const coverUrl = getBookCoverUrl(book);
   const pages = book.num_pages || meta?.totalPages || book.pages?.length || 0;
-  const favCount = book.num_favorites ?? 0;
-  const isFav = meta?.isFavorite ?? favoriteIdSet.has(id);
+  const hist = meta || historyMap.get(id);
+  const pct =
+    hist && hist.lastReadPage > 0 && pages > 0
+      ? Math.min(100, (hist.lastReadPage / pages) * 100)
+      : 0;
 
-  const link = el(
-    'a',
-    {
-      href: `/manga/${id}`,
-      className: 'manga-card-link',
-      onClick: (e) => {
-        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-        e.preventDefault();
-        if (onCardOpen) onCardOpen(book);
-        else navigate(`/manga/${id}`);
+  const badgeText = progressBadge || (pct > 0 ? `${pct.toFixed(0)}%` : null);
+
+  return el(
+    'article',
+    { className: 'manga-card' },
+    el(
+      'a',
+      {
+        href: progressBadge && hist?.lastReadPage ? `/read/${id}/${hist.lastReadPage}` : `/manga/${id}`,
+        className: 'manga-card-link',
+        onClick: (e) => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+          e.preventDefault();
+          navigate(progressBadge && hist?.lastReadPage ? `/read/${id}/${hist.lastReadPage}` : `/manga/${id}`);
+        },
       },
-    },
-    el(
-      'div',
-      { className: 'manga-cover-wrap' },
-      createMangaImg(coverUrl, title, { priority: 'lazy', className: 'manga-cover-img', width: 250, height: 350 }),
-      el('span', { className: 'badge badge-pages' }, `${pages} tr`),
-      isFav
-        ? el('span', { className: 'badge badge-fav', 'aria-label': 'Đã yêu thích' }, svgIcon('heart', 12))
-        : null,
-      meta?.isDownloaded
-        ? el('span', { className: 'badge badge-offline' }, 'Offline')
-        : null
-    ),
-    el(
-      'div',
-      { className: 'manga-card-body' },
-      el('p', { className: 'manga-card-title' }, title),
       el(
         'div',
-        { className: 'manga-card-meta' },
-        el('span', {}, `#${id}`),
-        favCount > 0 ? el('span', { className: 'meta-fav-count' }, svgIcon('heart', 12), formatNumber(favCount)) : null
-      )
-    )
+        { className: 'manga-cover-wrap' },
+        createMangaImg(coverUrl, title, { priority: 'lazy', className: 'manga-cover-img', width: 250, height: 350 }),
+        badgeText ? el('span', { className: 'badge badge-progress tabular-nums' }, badgeText) : null,
+        meta?.isDownloaded ? el('span', { className: 'badge badge-offline' }, 'Offline') : null,
+        el('span', { className: 'badge badge-pages tabular-nums' }, `${pages}p`)
+      ),
+      el('p', { className: 'manga-card-title' }, title)
+    ),
+    onDelete
+      ? el(
+          'button',
+          {
+            type: 'button',
+            className: 'card-corner-remove',
+            'aria-label': `Xóa ${title}`,
+            onClick: (e) => {
+              e.stopPropagation();
+              onDelete();
+            },
+          },
+          svgIcon('close', 14)
+        )
+      : null
   );
-
-  return el('article', { className: 'manga-card' }, link, extraFooter);
 }
 
 function buildErrorPanel(err, onRetry) {
@@ -207,13 +244,13 @@ function buildErrorPanel(err, onRetry) {
     el(
       'div',
       { className: 'btn-row' },
-      el('button', { type: 'button', className: 'btn btn-primary', onClick: onRetry }, svgIcon('refresh', 18), 'Thử lại'),
-      el('button', { type: 'button', className: 'btn btn-ghost', onClick: () => navigate('/downloads') }, svgIcon('download', 18), 'Đọc truyện đã tải')
+      el('button', { type: 'button', className: 'btn btn-primary', onClick: onRetry }, svgIcon('refresh', 17), 'Thử lại'),
+      el('button', { type: 'button', className: 'btn btn-surface', onClick: () => navigate('/downloads') }, svgIcon('download', 17), 'Truyện đã tải')
     )
   );
 }
 
-function buildSkeletonGrid(count = 8) {
+function buildSkeletonGrid(count = 6) {
   return el(
     'div',
     { className: 'manga-grid', 'aria-busy': 'true', 'aria-label': 'Đang tải danh sách truyện' },
@@ -229,7 +266,202 @@ function buildSkeletonGrid(count = 8) {
   );
 }
 
-// --- Screen 1: Home (`/`) ---
+// --- 4 Kinetic Bottom Sheets (Ranking, Daily Attendance, Points Wallet & Shop, My Coupons) ---
+
+function openSheet(title, contentNodes) {
+  appSheetTitle.textContent = title;
+  appSheetBody.replaceChildren(...contentNodes);
+  if (!appSheet.open) appSheet.showModal();
+}
+
+function openRankingSheet() {
+  const list = cachedPopularList.slice(0, 8);
+  const rows = list.length
+    ? list.map((book, idx) => {
+        const rank = idx + 1;
+        const score = Math.max(520, 1000 - idx * 65);
+        return el(
+          'button',
+          {
+            type: 'button',
+            className: 'ranking-row',
+            onClick: () => {
+              closeTopLayer(appSheet);
+              navigate(`/manga/${book.id}`);
+            },
+          },
+          el('span', { className: `rank-circle rank-${rank <= 3 ? rank : 'other'} tabular-nums` }, String(rank)),
+          el(
+            'div',
+            { className: 'ranking-thumb' },
+            createMangaImg(getBookCoverUrl(book), getBookTitle(book), { priority: 'lazy', width: 54, height: 72 })
+          ),
+          el(
+            'div',
+            { className: 'ranking-info' },
+            el('p', { className: 'ranking-title' }, getBookTitle(book)),
+            el('span', { className: 'ranking-score tabular-nums' }, `Hot Score: ${score}`)
+          )
+        );
+      })
+    : [el('p', { className: 'muted-hint' }, 'Chưa có dữ liệu bảng xếp hạng.')];
+
+  openSheet('Daily Hot Ranking', [el('div', { className: 'ranking-list' }, ...rows)]);
+}
+
+function openDailySheet() {
+  const state = loadUserState();
+  const today = getLocalDateString();
+  const checkedToday = state.last_check_in_date === today;
+  const nextDay = [1, 2, 3, 4, 5, 6, 7].find((d) => !state.checked_in_days.includes(d)) || 1;
+
+  const daysRow = el(
+    'div',
+    { className: 'attendance-row' },
+    ...[1, 2, 3, 4, 5, 6, 7].map((day) => {
+      const claimed = state.checked_in_days.includes(day);
+      return el(
+        'div',
+        { className: `attendance-day ${claimed ? 'claimed' : ''}` },
+        el('span', { className: 'attendance-d' }, `D${day}`),
+        el('span', { className: 'attendance-icon' }, svgIcon(claimed ? 'check' : 'star', 16)),
+        el('span', { className: 'attendance-pts tabular-nums' }, '+100')
+      );
+    })
+  );
+
+  const ctaBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: `attendance-cta-btn ${checkedToday ? 'claimed' : ''}`,
+      disabled: checkedToday,
+      onClick: () => {
+        const res = checkIn(nextDay);
+        updatePointsLabels();
+        showToast(res.message, res.ok ? 'success' : 'error');
+        openDailySheet();
+      },
+    },
+    checkedToday ? 'Checked-In Today!' : 'Check-In Now (+100 Points)'
+  );
+
+  openSheet('Daily Attendance Rewards', [
+    el('p', { className: 'sheet-subtitle' }, 'Check in daily to earn +100 Points and claim exclusive reading coupons!'),
+    daysRow,
+    ctaBtn,
+  ]);
+}
+
+function openWalletSheet() {
+  const state = loadUserState();
+
+  const codeInput = el('input', {
+    type: 'text',
+    className: 'wallet-code-input',
+    placeholder: 'MANGA999 or NHENTAI',
+    enterkeyhint: 'done',
+    autocapitalize: 'characters',
+    autocorrect: 'off',
+    'aria-label': 'Redeem Gift Code',
+  });
+
+  const redeemForm = el(
+    'form',
+    {
+      className: 'wallet-redeem-row',
+      onSubmit: (e) => {
+        e.preventDefault();
+        const res = redeemCode(codeInput.value);
+        updatePointsLabels();
+        showToast(res.message, res.ok ? 'success' : 'error');
+        openWalletSheet();
+      },
+    },
+    codeInput,
+    el('button', { type: 'submit', className: 'btn btn-primary wallet-apply-btn' }, 'Apply')
+  );
+
+  const shopCards = el(
+    'div',
+    { className: 'wallet-rewards-grid' },
+    ...SHOP_ITEMS.map((item) => {
+      const canAfford = state.points >= item.cost;
+      return el(
+        'div',
+        { className: 'wallet-reward-card' },
+        el('strong', { className: 'wallet-reward-name' }, item.label),
+        el('span', { className: 'wallet-reward-cost tabular-nums' }, `${item.cost} pts`),
+        el(
+          'button',
+          {
+            type: 'button',
+            className: `pill-btn compact ${canAfford ? 'btn-primary' : 'btn-surface'}`,
+            disabled: !canAfford,
+            onClick: () => {
+              const res = spendPoints(item.cost, item.name);
+              updatePointsLabels();
+              showToast(res.message, res.ok ? 'success' : 'error');
+              openWalletSheet();
+            },
+          },
+          'Redeem'
+        )
+      );
+    })
+  );
+
+  openSheet('Points Wallet & Shop', [
+    el(
+      'div',
+      { className: 'wallet-balance-card' },
+      el(
+        'div',
+        {},
+        el('span', { className: 'wallet-balance-label' }, 'Current Balance'),
+        el('strong', { className: 'wallet-balance-val tabular-nums' }, `${state.points} pts`)
+      ),
+      el('span', { className: 'wallet-balance-icon', 'aria-hidden': 'true' }, svgIcon('coin', 34))
+    ),
+    el('div', { className: 'sheet-group' }, el('span', { className: 'sheet-group-label' }, 'Redeem Gift Code'), redeemForm),
+    el('div', { className: 'sheet-group' }, el('span', { className: 'sheet-group-label' }, 'Claim Rewards'), shopCards),
+  ]);
+}
+
+function couponTitleFor(code) {
+  if (code.startsWith('DAILY-DAY-')) return 'Attendance Coupon';
+  if (code.startsWith('VIP-CODE-')) return 'VIP Gift Voucher';
+  if (code.startsWith('REDEEM-')) return 'Reward Pass';
+  if (code === 'LUCKY-RED') return 'Lucky Bonus Voucher';
+  return 'Premium Welcome Voucher';
+}
+
+function openCouponsSheet() {
+  const { coupons } = loadUserState();
+  openSheet('My Coupons & Tickets', [
+    el('p', { className: 'sheet-subtitle' }, 'Use coupons to unlock sponsored chapters, prefetch speedups, and HQ quality!'),
+    el(
+      'div',
+      { className: 'coupons-sheet-list' },
+      ...coupons.map((code) =>
+        el(
+          'div',
+          { className: 'coupon-ticket-row' },
+          el('span', { className: 'coupon-ticket-icon', 'aria-hidden': 'true' }, svgIcon('ticket', 20)),
+          el(
+            'div',
+            { className: 'coupon-ticket-info' },
+            el('strong', {}, couponTitleFor(code)),
+            el('span', {}, `Code: ${code}`)
+          ),
+          el('span', { className: 'coupon-active-pill' }, 'Active')
+        )
+      )
+    ),
+  ]);
+}
+
+// --- Screen 1: Home (`/`) — Exact Kinetic Reader Layout ---
 
 async function mountHomeView(container) {
   const cleanups = [];
@@ -241,166 +473,163 @@ async function mountHomeView(container) {
   let loadingMore = false;
   const loadedIds = new Set();
 
-  const heroSectionHost = el('div', { className: 'hero-host' });
-  const refreshStatus = el('span', { className: 'refresh-indicator' }, 'Tự làm mới mỗi 60s');
+  const heroHost = el('div', { className: 'kinetic-hero-host' });
+  const weeklyTrack = el('div', { className: 'weekly-track' });
+  const recommendCountBadge = el('span', { className: 'section-count-badge sky tabular-nums' }, '25+');
   const gridEl = el('div', { className: 'manga-grid' });
   const loadMoreHost = el('div', { className: 'load-more-host' });
   const sentinel = el('div', { className: 'scroll-sentinel', 'aria-hidden': 'true' });
 
-  const quickActions = el(
+  const { points } = loadUserState();
+  const quickRow = el(
     'section',
-    { className: 'quick-actions', 'aria-label': 'Thao tác nhanh' },
-    buildQuickAction('Tìm kiếm', 'search', 'coral', () => navigate('/search')),
-    buildQuickAction('Yêu thích', 'heart', 'sakura', () => navigate('/favorites')),
-    buildQuickAction('Lịch sử', 'history', 'sky', () => navigate('/history')),
-    buildQuickAction('Tải về', 'download', 'emerald', () => navigate('/downloads')),
-    buildQuickAction('Ngẫu nhiên', 'shuffle', 'amber', handleRandomJump),
-    buildQuickAction('Điểm danh', 'gift', 'coral', openRewardsDialog)
+    { className: 'kinetic-quick-grid', 'aria-label': 'Tiện ích nhanh' },
+    buildPastelAction('Ranking', 'trophy', 'gold', openRankingSheet),
+    buildPastelAction('Daily', 'calendar', 'mint', openDailySheet),
+    buildPastelAction(`${points} pts`, 'coin', 'coral', openWalletSheet, true),
+    buildPastelAction('Coupons', 'ticket', 'pink', openCouponsSheet)
   );
 
-  const feedHeader = el(
+  const tipBanner = el(
     'div',
-    { className: 'section-header' },
+    { className: 'kinetic-tip-card' },
+    el('span', { className: 'tip-icon-box', 'aria-hidden': 'true' }, svgIcon('bolt', 18)),
     el(
       'div',
-      {},
-      el('h2', { className: 'section-title' }, 'Mới cập nhật'),
-      refreshStatus
-    ),
-    el(
-      'button',
-      {
-        type: 'button',
-        className: 'pill-btn btn-surface',
-        onClick: () => refreshFirstPage(true),
-      },
-      svgIcon('refresh', 16),
-      el('span', {}, 'Làm mới')
+      { className: 'tip-text-col' },
+      el('strong', {}, 'Mẹo trải nghiệm mượt mà'),
+      el('p', {}, 'Mở 1 lần đọc để ảnh tải siêu tốc và mượt nhất nhé!')
     )
   );
 
-  const pageWrap = el(
-    'div',
-    { className: 'page-container' },
-    el('h1', { className: 'ios-large-title' }, 'Khám phá'),
-    heroSectionHost,
-    quickActions,
-    el('section', { className: 'feed-section', 'aria-label': 'Danh sách truyện mới' }, feedHeader, gridEl, loadMoreHost, sentinel)
+  const weeklySection = el(
+    'section',
+    { className: 'home-section', 'aria-label': 'Weekly Crazy Update' },
+    el(
+      'div',
+      { className: 'kinetic-section-head' },
+      el('h2', { className: 'kinetic-section-title' }, 'Weekly Crazy Update'),
+      el('span', { className: 'live-pill' }, 'LIVE')
+    ),
+    weeklyTrack
   );
-  container.replaceChildren(pageWrap);
 
-  function buildQuickAction(label, icon, accent, onClick) {
+  const recommendSection = el(
+    'section',
+    { className: 'home-section', 'aria-label': 'Recommend For You' },
+    el(
+      'div',
+      { className: 'kinetic-section-head' },
+      el('h2', { className: 'kinetic-section-title' }, 'Recommend For You'),
+      recommendCountBadge
+    ),
+    gridEl,
+    loadMoreHost,
+    sentinel
+  );
+
+  const homeWrap = el(
+    'div',
+    { className: 'home-layout' },
+    heroHost,
+    el('div', { className: 'home-curved-sheet' }, quickRow, tipBanner, weeklySection, recommendSection)
+  );
+  container.replaceChildren(homeWrap);
+
+  function buildPastelAction(label, icon, tone, onClick, isPoints = false) {
     return el(
       'button',
-      { type: 'button', className: `quick-action-pill accent-${accent}`, onClick },
-      svgIcon(icon, 18),
-      el('span', {}, label)
+      { type: 'button', className: `pastel-action-btn tone-${tone}`, onClick },
+      el('span', { className: 'pastel-icon-tile', 'aria-hidden': 'true' }, svgIcon(icon, 21)),
+      el('span', { className: 'pastel-action-label tabular-nums', dataset: isPoints ? { pointsLabel: '' } : {} }, label)
     );
   }
 
-  async function handleRandomJump() {
-    showToast('Đang chọn truyện ngẫu nhiên...');
-    try {
-      const randomBook = await fetchRandom(abortController.signal);
-      if (randomBook?.id) {
-        await upsertMetadata(randomBook);
-        navigate(`/manga/${randomBook.id}`);
-      }
-    } catch (err) {
-      if (err.name !== 'AbortError') showToast(err.message || 'Không lấy được truyện ngẫu nhiên.', 'error');
-    }
-  }
-
-  function renderHeroCarousel(popularList) {
-    const items = (popularList || []).slice(0, 8);
+  function renderHeroBanner(popularList) {
+    const items = (popularList || []).slice(0, 6);
     if (!items.length) {
-      heroSectionHost.replaceChildren();
+      heroHost.replaceChildren();
       return;
     }
 
     const track = el(
       'div',
-      { className: 'carousel-track', tabindex: '0', role: 'group', 'aria-label': 'Truyện phổ biến' },
+      { className: 'carousel-track', tabindex: '0', role: 'group', 'aria-label': 'Truyện thịnh hành' },
       ...items.map((book, idx) => {
         const title = getBookTitle(book);
         const cover = getBookCoverUrl(book);
-        // optimize-image-priority: LCP first hero slide is fetchpriority="high"; hidden slides are low + lazy
         const priority = idx === 0 ? 'high' : 'low';
         return el(
-          'article',
+          'a',
           {
-            className: 'hero-slide',
+            href: `/manga/${book.id}`,
+            className: 'kinetic-hero-slide',
             role: 'group',
             'aria-roledescription': 'slide',
-            'aria-label': `${idx + 1} / ${items.length}`,
-            dataset: { markerName: `Xem truyện nổi bật ${idx + 1}: ${title}` },
+            'aria-label': `${idx + 1} / ${items.length}: ${title}`,
+            dataset: { markerName: `Trending ${idx + 1}: ${title}` },
+            onClick: (e) => {
+              if (e.metaKey || e.ctrlKey) return;
+              e.preventDefault();
+              navigate(`/manga/${book.id}`);
+            },
           },
+          createMangaImg(cover, title, { priority, className: 'kinetic-hero-img', width: 500, height: 680 }),
           el(
             'div',
-            { className: 'hero-slide-bg', 'aria-hidden': 'true' },
-            createMangaImg(cover, '', { priority })
-          ),
-          el(
-            'div',
-            { className: 'hero-slide-content' },
+            { className: 'kinetic-hero-overlay' },
             el(
               'div',
-              { className: 'hero-poster' },
-              createMangaImg(cover, title, { priority, width: 180, height: 252 })
+              { className: 'hero-pill-row tabular-nums' },
+              el('span', { className: 'trending-pill' }, `TRENDING #${idx + 1}`),
+              el('span', { className: 'pages-glass-pill' }, `${book.num_pages || 0} PAGES`)
             ),
-            el(
-              'div',
-              { className: 'hero-info' },
-              el('h2', { className: 'hero-title' }, title),
-              el(
-                'div',
-                { className: 'hero-meta tabular-nums' },
-                el('span', { className: 'meta-pill meta-rank' }, `Top ${idx + 1}`),
-                el('span', { className: 'meta-pill' }, `${book.num_pages || 0} trang`),
-                el('span', { className: 'meta-pill' }, svgIcon('heart', 13), formatNumber(book.num_favorites || 0)),
-                el('span', { className: 'meta-pill' }, `#${book.id}`)
-              ),
-              el(
-                'div',
-                { className: 'hero-actions' },
-                el(
-                  'a',
-                  {
-                    href: `/manga/${book.id}`,
-                    className: 'btn btn-primary',
-                    onClick: (e) => {
-                      if (e.metaKey || e.ctrlKey) return;
-                      e.preventDefault();
-                      navigate(`/manga/${book.id}`);
-                    },
-                  },
-                  svgIcon('book', 17),
-                  'Xem chi tiết'
-                )
-              )
-            )
+            el('h1', { className: 'kinetic-hero-title' }, title)
           )
         );
       })
     );
 
-    const carouselSection = el(
+    const carousel = el(
       'section',
-      { className: 'carousel hero-carousel', 'aria-roledescription': 'carousel', 'aria-label': 'Truyện phổ biến' },
+      { className: 'carousel kinetic-hero-carousel', 'aria-roledescription': 'carousel', 'aria-label': 'Truyện nổi bật' },
       el(
         'div',
         { className: 'carousel-controls' },
-        el('button', { type: 'button', className: 'carousel-nav-btn', dataset: { direction: 'previous' }, 'aria-label': 'Truyện nổi bật trước' }, svgIcon('chevronLeft', 22)),
-        el('button', { type: 'button', className: 'carousel-nav-btn', dataset: { direction: 'next' }, 'aria-label': 'Truyện nổi bật tiếp theo' }, svgIcon('chevronRight', 22))
+        el('button', { type: 'button', className: 'carousel-nav-btn', dataset: { direction: 'previous' }, 'aria-label': 'Trước' }, svgIcon('chevronLeft', 20)),
+        el('button', { type: 'button', className: 'carousel-nav-btn', dataset: { direction: 'next' }, 'aria-label': 'Tiếp' }, svgIcon('chevronRight', 20))
       ),
       track,
       el('p', { className: 'visually-hidden', role: 'status', 'aria-live': 'polite' }),
-      el('nav', { className: 'carousel-markers', 'aria-label': 'Chọn truyện nổi bật' })
+      el('nav', { className: 'carousel-markers', 'aria-label': 'Chọn slide nổi bật' })
     );
 
-    heroSectionHost.replaceChildren(carouselSection);
-    const stopCarousel = initCarousel(carouselSection);
-    cleanups.push(stopCarousel);
+    heroHost.replaceChildren(carousel);
+    cleanups.push(initCarousel(carousel));
+  }
+
+  function renderWeeklyUpdate(list) {
+    const items = (list || []).slice(0, 8);
+    if (!items.length) return;
+    weeklyTrack.replaceChildren(
+      ...items.map((book) => {
+        const title = getBookTitle(book);
+        return el(
+          'a',
+          {
+            href: `/manga/${book.id}`,
+            className: 'weekly-card',
+            onClick: (e) => {
+              if (e.metaKey || e.ctrlKey) return;
+              e.preventDefault();
+              navigate(`/manga/${book.id}`);
+            },
+          },
+          createMangaImg(getBookCoverUrl(book), title, { priority: 'lazy', className: 'weekly-card-img', width: 220, height: 220 }),
+          el('div', { className: 'weekly-card-scrim' }, el('p', { className: 'weekly-card-title' }, title))
+        );
+      })
+    );
   }
 
   function renderLoadMoreControl() {
@@ -411,11 +640,7 @@ async function mountHomeView(container) {
     }
     if (currentPage < totalPages) {
       loadMoreHost.appendChild(
-        el(
-          'button',
-          { type: 'button', className: 'btn btn-surface', onClick: () => loadMoreHome() },
-          `Tải thêm (Trang ${currentPage + 1} / ${totalPages})`
-        )
+        el('button', { type: 'button', className: 'btn btn-surface', onClick: () => loadMoreHome() }, `Tải thêm (Trang ${currentPage + 1} / ${totalPages})`)
       );
     }
   }
@@ -444,35 +669,25 @@ async function mountHomeView(container) {
     }
   }
 
-  async function refreshFirstPage(manual = false) {
+  async function refreshFirstPage() {
     try {
       const data = await fetchGalleries(1, 25, abortController.signal);
       totalPages = data.num_pages || totalPages;
-      const incoming = data.result || [];
-      let added = 0;
       const prependFrag = document.createDocumentFragment();
-      for (const item of incoming) {
+      for (const item of data.result || []) {
         if (!loadedIds.has(item.id)) {
           loadedIds.add(item.id);
           prependFrag.appendChild(buildMangaCard(item));
-          added++;
         }
       }
-      if (added > 0) {
-        gridEl.prepend(prependFrag);
-        if (manual) showToast(`Đã cập nhật thêm ${added} truyện mới.`);
-      } else if (manual) {
-        showToast('Danh sách đã là mới nhất.');
-      }
-      const now = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      refreshStatus.textContent = `Cập nhật lúc ${now} • Tự làm mới mỗi 60s`;
+      if (prependFrag.childNodes.length > 0) gridEl.prepend(prependFrag);
     } catch {
-      if (manual) showToast('Không làm mới được dữ liệu.', 'error');
+      // Silent background refresh failure
     }
   }
 
   async function loadInitial() {
-    gridEl.replaceChildren(...buildSkeletonGrid(10).children);
+    gridEl.replaceChildren(...buildSkeletonGrid(6).children);
     loadMoreHost.replaceChildren();
     loadedIds.clear();
     currentPage = 1;
@@ -485,23 +700,30 @@ async function mountHomeView(container) {
     if (abortController.signal.aborted) return;
 
     if (popularRes.status === 'fulfilled') {
-      renderHeroCarousel(popularRes.value);
+      cachedPopularList = popularRes.value || [];
+      renderHeroBanner(cachedPopularList);
+      renderWeeklyUpdate(cachedPopularList);
     }
 
     if (latestRes.status === 'fulfilled') {
       const data = latestRes.value;
       totalPages = data.num_pages || 1;
+      const list = data.result || [];
+      recommendCountBadge.textContent = `${list.length}+`;
+      if (!cachedPopularList.length && list.length) {
+        cachedPopularList = list;
+        renderHeroBanner(list);
+        renderWeeklyUpdate(list);
+      }
       gridEl.replaceChildren();
       const frag = document.createDocumentFragment();
-      for (const item of data.result || []) {
+      for (const item of list) {
         if (loadedIds.has(item.id)) continue;
         loadedIds.add(item.id);
         frag.appendChild(buildMangaCard(item));
       }
       gridEl.appendChild(frag);
       renderLoadMoreControl();
-      const now = new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
-      refreshStatus.textContent = `Cập nhật lúc ${now} • Tự làm mới mỗi 60s`;
     } else {
       gridEl.replaceChildren();
       loadMoreHost.replaceChildren(buildErrorPanel(latestRes.reason, loadInitial));
@@ -510,29 +732,25 @@ async function mountHomeView(container) {
 
   const io = new IntersectionObserver(
     (entries) => {
-      if (entries.some((e) => e.isIntersecting)) {
-        loadMoreHome();
-      }
+      if (entries.some((e) => e.isIntersecting)) loadMoreHome();
     },
     { root: isStandaloneMode() ? appStage : null, rootMargin: '400px 0px' }
   );
   io.observe(sentinel);
   cleanups.push(() => io.disconnect());
 
-  // Auto-refresh every 60 seconds per spec while Home is active & visible
+  // Auto-refresh every 60 seconds per spec
   const refreshInterval = setInterval(() => {
-    if (!document.hidden && loadedIds.size > 0) {
-      refreshFirstPage(false);
-    }
+    if (!document.hidden && loadedIds.size > 0) refreshFirstPage();
   }, 60000);
   cleanups.push(() => clearInterval(refreshInterval));
-  cleanups.push(() => revokeObjectUrls(pageWrap));
+  cleanups.push(() => revokeObjectUrls(homeWrap));
 
   await loadInitial();
   return () => cleanups.forEach((fn) => fn());
 }
 
-// --- Screen 2: Search (`/search`) ---
+// --- Screen 2: Search (`/search`) — Exact Kinetic Search & Discover Empty State ---
 
 async function mountSearchView(container, { q: initialQuery, sort: initialSort }) {
   const cleanups = [];
@@ -549,7 +767,7 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
   const searchInput = el('input', {
     type: 'search',
     className: 'search-input',
-    placeholder: 'Từ khóa, tag hoặc số ID (vd: 177013)...',
+    placeholder: 'Search tags, titles, or #ID...',
     value: query,
     enterkeyhint: 'search',
     autocapitalize: 'none',
@@ -557,111 +775,112 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
     'aria-label': 'Tìm kiếm truyện theo từ khóa, tag hoặc ID',
   });
 
-  const sortSelect = el(
-    'select',
-    {
-      className: 'sort-select',
-      'aria-label': 'Sắp xếp kết quả tìm kiếm',
-      onChange: (e) => {
-        sort = e.target.value;
-        syncUrlAndRun(true);
-      },
-    },
-    el('option', { value: 'popular', selected: sort === 'popular' }, 'Phổ biến nhất'),
-    el('option', { value: 'popular-week', selected: sort === 'popular-week' }, 'Phổ biến tuần'),
-    el('option', { value: 'popular-today', selected: sort === 'popular-today' }, 'Phổ biến hôm nay'),
-    el('option', { value: 'date', selected: sort === 'date' }, 'Mới nhất')
-  );
-
   const searchForm = el(
     'form',
     {
-      className: 'search-form',
+      className: 'kinetic-search-bar',
       role: 'search',
       onSubmit: (e) => {
         e.preventDefault();
         query = searchInput.value.trim();
-        syncUrlAndRun(true);
+        syncUrlAndRun();
       },
     },
+    searchInput,
     el(
-      'div',
-      { className: 'search-input-wrap' },
-      svgIcon('search', 18),
-      searchInput
-    ),
-    sortSelect,
-    el('button', { type: 'submit', className: 'btn btn-primary' }, 'Tìm')
+      'button',
+      { type: 'submit', className: 'search-submit-icon', 'aria-label': 'Tìm kiếm' },
+      svgIcon('search', 19)
+    )
   );
 
-  const chipRow = el(
+  const sortRow = el(
     'div',
-    { className: 'chip-row', role: 'group', 'aria-label': 'Tag gợi ý nhanh' },
-    ...QUICK_TAGS.map((tag) =>
+    { className: 'sort-pill-row', role: 'group', 'aria-label': 'Sắp xếp kết quả' },
+    ...SORT_OPTIONS.map((opt) =>
       el(
         'button',
         {
           type: 'button',
-          className: `chip-btn ${query.toLowerCase() === tag ? 'active' : ''}`,
-          dataset: { tag },
+          className: `sort-pill-btn ${sort === opt.value ? 'active' : ''}`,
+          dataset: { sortVal: opt.value },
           onClick: () => {
-            query = tag;
-            searchInput.value = tag;
-            syncUrlAndRun(true);
+            sort = opt.value;
+            for (const b of sortRow.querySelectorAll('.sort-pill-btn')) {
+              b.classList.toggle('active', b.dataset.sortVal === sort);
+            }
+            if (query) syncUrlAndRun();
           },
         },
-        tag
+        opt.label
       )
     )
   );
 
-  const summaryLine = el('p', { className: 'search-summary' });
-  const resultsHost = el('div', { className: 'manga-grid' });
-  const statusHost = el('div', { className: 'load-more-host' });
+  const contentHost = el('div', { className: 'search-content-host' });
+  const loadMoreHost = el('div', { className: 'load-more-host' });
   const sentinel = el('div', { className: 'scroll-sentinel', 'aria-hidden': 'true' });
 
   const pageWrap = el(
     'div',
-    { className: 'page-container' },
-    el('h1', { className: 'page-heading' }, 'Tìm kiếm'),
+    { className: 'page-container search-page' },
     searchForm,
-    chipRow,
-    summaryLine,
-    resultsHost,
-    statusHost,
+    sortRow,
+    contentHost,
+    loadMoreHost,
     sentinel
   );
   container.replaceChildren(pageWrap);
 
-  function updateChipActive() {
-    for (const btn of chipRow.querySelectorAll('.chip-btn')) {
-      btn.classList.toggle('active', query.toLowerCase() === btn.dataset.tag);
-    }
+  function buildDiscoverEmpty() {
+    return el(
+      'section',
+      { className: 'discover-empty-state' },
+      el('div', { className: 'discover-icon-box coral', 'aria-hidden': 'true' }, svgIcon('search', 28)),
+      el('h1', { className: 'discover-title' }, 'Discover Something New'),
+      el('p', { className: 'discover-desc' }, 'Search by title, artist, tag, or enter a 6-digit gallery code directly.'),
+      el('p', { className: 'quick-searches-heading' }, svgIcon('flame', 15), 'Quick Searches'),
+      el(
+        'div',
+        { className: 'quick-tags-wrap' },
+        ...QUICK_TAGS.map((tag) =>
+          el(
+            'button',
+            {
+              type: 'button',
+              className: 'hash-tag-pill',
+              onClick: () => {
+                query = tag;
+                searchInput.value = tag;
+                syncUrlAndRun();
+              },
+            },
+            `#${tag}`
+          )
+        )
+      )
+    );
   }
 
-  function syncUrlAndRun(pushUrl) {
-    updateChipActive();
+  function syncUrlAndRun() {
     const qs = new URLSearchParams();
     if (query) qs.set('q', query);
     if (sort && sort !== 'popular') qs.set('sort', sort);
-    const nextUrl = `/search${qs.toString() ? `?${qs}` : ''}`;
-    if (pushUrl) window.history.replaceState(null, '', nextUrl);
+    window.history.replaceState(null, '', `/search${qs.toString() ? `?${qs}` : ''}`);
     runSearch();
   }
 
+  let gridEl = null;
+
   function renderLoadMore() {
-    statusHost.replaceChildren();
+    loadMoreHost.replaceChildren();
     if (loadingMore) {
-      statusHost.appendChild(el('div', { className: 'inline-loader' }, el('span', { className: 'spinner small' }), 'Đang tải thêm...'));
+      loadMoreHost.appendChild(el('div', { className: 'inline-loader' }, el('span', { className: 'spinner small' }), 'Đang tải thêm...'));
       return;
     }
     if (query && !/^\d+$/.test(query) && currentPage < totalPages) {
-      statusHost.appendChild(
-        el(
-          'button',
-          { type: 'button', className: 'btn btn-surface', onClick: () => loadMoreSearch() },
-          `Tải thêm (Trang ${currentPage + 1} / ${totalPages})`
-        )
+      loadMoreHost.appendChild(
+        el('button', { type: 'button', className: 'btn btn-surface', onClick: () => loadMoreSearch() }, `Tải thêm (Trang ${currentPage + 1} / ${totalPages})`)
       );
     }
   }
@@ -672,58 +891,59 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
     loadedIds.clear();
     currentPage = 1;
     totalPages = 1;
+    gridEl = null;
+    loadMoreHost.replaceChildren();
 
     if (!query) {
-      summaryLine.textContent = 'Nhập từ khóa, chọn tag gợi ý hoặc gõ trực tiếp số ID truyện.';
-      resultsHost.replaceChildren();
-      statusHost.replaceChildren();
+      contentHost.replaceChildren(buildDiscoverEmpty());
       return;
     }
 
-    resultsHost.replaceChildren(...buildSkeletonGrid(6).children);
-    statusHost.replaceChildren();
+    contentHost.replaceChildren(buildSkeletonGrid(6));
 
-    // Direct numeric ID lookup per spec: regex ^\d+$ calls /galleries/{id}
+    // Direct numeric ID lookup per spec (^\d+$)
     if (/^\d+$/.test(query)) {
-      summaryLine.textContent = `Tra cứu trực tiếp mã truyện #${query}...`;
       try {
         const book = await fetchBook(query, abortController.signal);
-        summaryLine.textContent = `Tìm thấy truyện #${book.id}`;
-        resultsHost.replaceChildren(buildMangaCard(book));
+        gridEl = el('div', { className: 'manga-grid' }, buildMangaCard(book));
+        contentHost.replaceChildren(el('p', { className: 'search-summary' }, `Gallery #${book.id}`), gridEl);
       } catch (err) {
         if (err.name === 'AbortError') return;
-        resultsHost.replaceChildren();
-        statusHost.replaceChildren(buildErrorPanel(err, runSearch));
+        contentHost.replaceChildren(buildErrorPanel(err, runSearch));
       }
       return;
     }
 
-    summaryLine.textContent = `Đang tìm "${query}"...`;
     try {
       const data = await searchGalleries(query, 1, sort, abortController.signal);
       totalPages = data.num_pages || 1;
       const items = data.result || [];
-      summaryLine.textContent =
-        data.total > 0
-          ? `Tìm thấy ${formatNumber(data.total)} kết quả cho "${query}"`
-          : `Không tìm thấy kết quả nào cho "${query}".`;
-      resultsHost.replaceChildren();
+      if (!items.length) {
+        contentHost.replaceChildren(
+          el('section', { className: 'state-panel' }, el('p', {}, `Không tìm thấy kết quả cho "${query}".`))
+        );
+        return;
+      }
+      gridEl = el('div', { className: 'manga-grid' });
       const frag = document.createDocumentFragment();
       for (const item of items) {
         loadedIds.add(item.id);
         frag.appendChild(buildMangaCard(item));
       }
-      resultsHost.appendChild(frag);
+      gridEl.appendChild(frag);
+      contentHost.replaceChildren(
+        el('p', { className: 'search-summary tabular-nums' }, `${formatNumber(data.total || items.length)} kết quả cho "${query}"`),
+        gridEl
+      );
       renderLoadMore();
     } catch (err) {
       if (err.name === 'AbortError') return;
-      resultsHost.replaceChildren();
-      statusHost.replaceChildren(buildErrorPanel(err, runSearch));
+      contentHost.replaceChildren(buildErrorPanel(err, runSearch));
     }
   }
 
   async function loadMoreSearch() {
-    if (loadingMore || !query || /^\d+$/.test(query) || currentPage >= totalPages) return;
+    if (loadingMore || !gridEl || !query || /^\d+$/.test(query) || currentPage >= totalPages) return;
     loadingMore = true;
     renderLoadMore();
     try {
@@ -737,7 +957,7 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
         loadedIds.add(item.id);
         frag.appendChild(buildMangaCard(item));
       }
-      resultsHost.appendChild(frag);
+      gridEl.appendChild(frag);
     } catch (err) {
       if (err.name !== 'AbortError') showToast(err.message || 'Lỗi tải thêm kết quả.', 'error');
     } finally {
@@ -765,35 +985,55 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
 async function mountCollectionView(container, kind) {
   const configs = {
     favorites: {
-      title: 'Truyện yêu thích',
-      empty: 'Chưa có truyện yêu thích nào. Nhấn biểu tượng tim ở trang chi tiết để lưu lại.',
+      title: 'My Favorites',
+      subtitle: 'Books you loved and bookmarked',
+      tone: 'pink',
+      icon: 'heart',
+      emptyTitle: 'No Favorites Yet',
+      emptyDesc: 'Tap the heart button on any manga to bookmark it here.',
       fetchList: getFavorites,
     },
     history: {
-      title: 'Lịch sử đọc',
-      empty: 'Bạn chưa đọc truyện nào gần đây.',
+      title: 'Reading History',
+      subtitle: 'Pick up right where you left off',
+      tone: 'amber',
+      icon: 'history',
+      emptyTitle: 'No Reading History',
+      emptyDesc: 'Chapters you read will automatically appear here with your last page saved.',
       fetchList: getHistory,
     },
     downloads: {
-      title: 'Đã tải offline',
-      empty: 'Chưa có truyện nào được lưu offline. Vào trang chi tiết truyện và chọn Tải offline.',
+      title: 'Downloaded Books',
+      subtitle: 'Available offline anytime',
+      tone: 'sky',
+      icon: 'download',
+      emptyTitle: 'No Offline Downloads',
+      emptyDesc: 'Download your favorite titles from their detail page for instant offline reading.',
       fetchList: getDownloads,
     },
   };
   const cfg = configs[kind];
 
-  const pageWrap = el('div', { className: 'page-container' });
+  const pageWrap = el('div', { className: 'page-container collection-page' });
   container.replaceChildren(pageWrap);
 
   async function renderList() {
     const records = await cfg.fetchList();
+    await refreshLibraryStats();
     revokeObjectUrls(pageWrap);
 
     const header = el(
       'div',
-      { className: 'section-header' },
-      el('h1', { className: 'page-heading' }, cfg.title),
-      el('span', { className: 'count-pill' }, `${records.length} truyện`)
+      { className: 'collection-header' },
+      el(
+        'div',
+        { className: 'collection-title-row' },
+        el('h1', { className: 'collection-title' }, cfg.title),
+        records.length > 0
+          ? el('span', { className: `collection-badge tone-${cfg.tone} tabular-nums` }, String(records.length))
+          : null
+      ),
+      el('p', { className: 'collection-subtitle' }, cfg.subtitle)
     );
 
     if (!records.length) {
@@ -801,9 +1041,19 @@ async function mountCollectionView(container, kind) {
         header,
         el(
           'section',
-          { className: 'state-panel' },
-          el('p', {}, cfg.empty),
-          el('button', { type: 'button', className: 'btn btn-primary', onClick: () => navigate('/') }, 'Khám phá ngay')
+          { className: 'discover-empty-state' },
+          el('div', { className: `discover-icon-box ${cfg.tone}`, 'aria-hidden': 'true' }, svgIcon(cfg.icon, 28)),
+          el('h2', { className: 'discover-title' }, cfg.emptyTitle),
+          el('p', { className: 'discover-desc' }, cfg.emptyDesc),
+          el(
+            'button',
+            {
+              type: 'button',
+              className: `btn ${cfg.tone === 'sky' ? 'btn-sky' : 'btn-primary'}`,
+              onClick: () => navigate('/'),
+            },
+            'Explore Manga'
+          )
         )
       );
       return;
@@ -814,118 +1064,23 @@ async function mountCollectionView(container, kind) {
       { className: 'manga-grid' },
       ...records.map((rec) => {
         const book = rec.bookJson || { id: rec.id, num_pages: rec.totalPages };
-        const pct = rec.totalPages > 0 ? Math.min(100, Math.round((rec.lastReadPage / rec.totalPages) * 100)) : 0;
-        const footerChildren = [];
+        const progressBadge =
+          kind === 'history' ? `${rec.lastReadPage}/${rec.totalPages || book.num_pages || '?'}` : null;
 
-        if (kind === 'history') {
-          footerChildren.push(
-            el(
-              'div',
-              { className: 'progress-block' },
-              el(
-                'div',
-                { className: 'progress-labels' },
-                el('span', {}, `Trang ${rec.lastReadPage} / ${rec.totalPages || '?'}`),
-                el('span', {}, formatRelativeTime(rec.lastReadTime))
-              ),
-              el(
-                'div',
-                { className: 'progress-track', role: 'progressbar', 'aria-valuenow': String(pct), 'aria-valuemin': '0', 'aria-valuemax': '100' },
-                el('div', { className: 'progress-fill', style: { width: `${pct}%` } })
-              )
-            ),
-            el(
-              'div',
-              { className: 'card-action-row' },
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: 'pill-btn btn-primary compact',
-                  onClick: () => navigate(`/read/${rec.id}/${rec.lastReadPage}`),
-                },
-                'Đọc tiếp'
-              ),
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: 'icon-btn compact',
-                  'aria-label': `Xóa ${getBookTitle(book)} khỏi lịch sử`,
-                  onClick: async () => {
-                    await clearHistoryItem(rec.id);
-                    renderList();
-                  },
-                },
-                svgIcon('trash', 16)
-              )
-            )
-          );
-        } else if (kind === 'favorites') {
-          footerChildren.push(
-            el(
-              'div',
-              { className: 'card-action-row' },
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: 'pill-btn btn-surface compact',
-                  onClick: () => navigate(rec.lastReadPage > 0 ? `/read/${rec.id}/${rec.lastReadPage}` : `/read/${rec.id}/1`),
-                },
-                rec.lastReadPage > 0 ? `Đọc tiếp (tr.${rec.lastReadPage})` : 'Đọc ngay'
-              ),
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: 'icon-btn compact active-heart',
-                  'aria-label': `Bỏ yêu thích ${getBookTitle(book)}`,
-                  onClick: async () => {
-                    await toggleFavorite(book);
-                    await refreshFavoriteIds();
-                    renderList();
-                  },
-                },
-                svgIcon('heart', 16)
-              )
-            )
-          );
-        } else if (kind === 'downloads') {
-          footerChildren.push(
-            el(
-              'div',
-              { className: 'card-action-row' },
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: 'pill-btn btn-primary compact',
-                  onClick: () => navigate(`/read/${rec.id}/${Math.max(1, rec.lastReadPage || 1)}`),
-                },
-                'Đọc offline'
-              ),
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: 'icon-btn compact',
-                  'aria-label': `Xóa bản tải offline của ${getBookTitle(book)}`,
-                  onClick: async () => {
-                    await removeBookCache(book);
-                    await setDownloaded(book, false);
-                    showToast('Đã xóa bản lưu offline.');
-                    renderList();
-                  },
-                },
-                svgIcon('trash', 16)
-              )
-            )
-          );
-        }
-
-        const extraFooter = el('div', { className: 'manga-card-footer' }, ...footerChildren);
-        return buildMangaCard(book, { meta: rec, extraFooter });
+        return buildMangaCard(book, {
+          meta: rec,
+          progressBadge,
+          onDelete: async () => {
+            if (kind === 'history') await clearHistoryItem(rec.id);
+            else if (kind === 'favorites') await toggleFavorite(book);
+            else if (kind === 'downloads') {
+              await removeBookCache(book);
+              await setDownloaded(book, false);
+              showToast('Đã xóa bản lưu offline.');
+            }
+            renderList();
+          },
+        });
       })
     );
 
@@ -936,7 +1091,7 @@ async function mountCollectionView(container, kind) {
   return () => revokeObjectUrls(pageWrap);
 }
 
-// --- Screen 6: Detail (`/manga/:id`) ---
+// --- Screen 6: Detail (`/manga/:id`) — Exact Kinetic Detail Layout ---
 
 async function mountDetailView(container, { id }) {
   const cleanups = [];
@@ -945,11 +1100,15 @@ async function mountDetailView(container, { id }) {
   cleanups.push(() => abortController.abort());
   cleanups.push(() => downloadAbort?.abort());
 
-  const pageWrap = el('div', { className: 'page-container detail-page' });
+  const pageWrap = el('div', { className: 'detail-layout' });
   container.replaceChildren(pageWrap);
 
   pageWrap.replaceChildren(
-    el('div', { className: 'state-panel' }, el('div', { className: 'spinner' }), el('p', {}, `Đang tải thông tin truyện #${id}...`))
+    el(
+      'div',
+      { className: 'page-container' },
+      el('div', { className: 'state-panel' }, el('div', { className: 'spinner' }), el('p', {}, `Đang tải truyện #${id}...`))
+    )
   );
 
   let book = null;
@@ -965,39 +1124,20 @@ async function mountDetailView(container, { id }) {
       book = meta.bookJson;
       offlineFallbackUsed = true;
     } else {
-      pageWrap.replaceChildren(buildErrorPanel(err, () => navigate(`/manga/${id}`, { replace: true })));
+      pageWrap.replaceChildren(
+        el('div', { className: 'page-container' }, buildErrorPanel(err, () => navigate(`/manga/${id}`, { replace: true })))
+      );
       return () => cleanups.forEach((fn) => fn());
     }
   }
 
   const title = getBookTitle(book);
-  setToolbarTitle(title);
   const subTitle = getBookSubTitle(book);
   const coverUrl = getBookCoverUrl(book);
   const totalPages = book.num_pages || book.pages?.length || meta?.totalPages || 0;
   let isFavorite = Boolean(meta?.isFavorite);
   let isDownloaded = Boolean(meta?.isDownloaded);
   const lastReadPage = meta?.lastReadPage || 0;
-
-  const favBtn = el(
-    'button',
-    {
-      type: 'button',
-      className: `btn ${isFavorite ? 'btn-sakura' : 'btn-surface'}`,
-      'aria-pressed': String(isFavorite),
-      onClick: async () => {
-        const updated = await toggleFavorite(book);
-        isFavorite = updated.isFavorite;
-        await refreshFavoriteIds();
-        favBtn.className = `btn ${isFavorite ? 'btn-sakura' : 'btn-surface'}`;
-        favBtn.setAttribute('aria-pressed', String(isFavorite));
-        favBtn.replaceChildren(svgIcon(isFavorite ? 'heart' : 'heartOutline', 18), isFavorite ? 'Đã yêu thích' : 'Yêu thích');
-        showToast(isFavorite ? 'Đã thêm vào Yêu thích.' : 'Đã bỏ khỏi Yêu thích.');
-      },
-    },
-    svgIcon(isFavorite ? 'heart' : 'heartOutline', 18),
-    isFavorite ? 'Đã yêu thích' : 'Yêu thích'
-  );
 
   const downloadStatusEl = el('p', { className: 'download-progress-text' });
   let downloading = false;
@@ -1006,7 +1146,9 @@ async function mountDetailView(container, { id }) {
     'button',
     {
       type: 'button',
-      className: `btn ${isDownloaded ? 'btn-emerald' : 'btn-surface'}`,
+      className: `detail-circle-btn glass-clear ${isDownloaded ? 'is-downloaded' : ''}`,
+      'aria-label': isDownloaded ? 'Xóa bản tải offline' : 'Tải offline',
+      title: isDownloaded ? 'Đã lưu offline (nhấn để xóa)' : 'Tải offline',
       onClick: async () => {
         if (downloading) {
           downloadAbort?.abort();
@@ -1015,17 +1157,17 @@ async function mountDetailView(container, { id }) {
         if (isDownloaded) {
           await removeBookCache(book);
           await setDownloaded(book, false);
+          await refreshLibraryStats();
           isDownloaded = false;
-          downloadBtn.className = 'btn btn-surface';
-          downloadBtn.replaceChildren(svgIcon('download', 18), 'Tải offline');
+          downloadBtn.classList.remove('is-downloaded');
           downloadStatusEl.textContent = '';
-          showToast('Đã xóa cache offline.');
+          showToast('Đã xóa bản lưu offline.');
           return;
         }
         downloading = true;
         downloadAbort = new AbortController();
-        downloadBtn.replaceChildren(svgIcon('close', 18), 'Hủy tải...');
-        downloadStatusEl.textContent = `Đang tải 0 / ${totalPages} trang...`;
+        downloadBtn.replaceChildren(svgIcon('close', 18));
+        downloadStatusEl.textContent = `Đang tải offline 0 / ${totalPages} trang...`;
         try {
           await downloadBookPages(book, {
             signal: downloadAbort.signal,
@@ -1034,126 +1176,128 @@ async function mountDetailView(container, { id }) {
             },
           });
           await setDownloaded(book, true);
+          await refreshLibraryStats();
           isDownloaded = true;
-          downloadBtn.className = 'btn btn-emerald';
-          downloadBtn.replaceChildren(svgIcon('download', 18), 'Đã lưu offline (Xóa)');
-          downloadStatusEl.textContent = `Đã lưu toàn bộ ${totalPages} trang để đọc không cần mạng.`;
-          showToast('Tải offline thành công!');
+          downloadBtn.classList.add('is-downloaded');
+          downloadStatusEl.textContent = `Đã lưu đủ ${totalPages} trang để đọc offline.`;
+          showToast('Tải offline thành công!', 'success');
         } catch (err) {
-          if (err.name === 'AbortError') {
-            downloadStatusEl.textContent = 'Đã hủy tải xuống.';
-          } else {
-            downloadStatusEl.textContent = err.message || 'Lỗi tải ảnh offline.';
-            showToast(err.message || 'Tải offline thất bại.', 'error');
-          }
-          downloadBtn.replaceChildren(svgIcon('download', 18), 'Tải offline');
+          downloadStatusEl.textContent = err.name === 'AbortError' ? 'Đã hủy tải xuống.' : (err.message || 'Lỗi tải offline.');
+          if (err.name !== 'AbortError') showToast(err.message || 'Tải offline thất bại.', 'error');
         } finally {
           downloading = false;
           downloadAbort = null;
+          downloadBtn.replaceChildren(svgIcon('download', 19));
         }
       },
     },
-    svgIcon('download', 18),
-    isDownloaded ? 'Đã lưu offline (Xóa)' : 'Tải offline'
+    svgIcon('download', 19)
   );
 
-  // Group tags by type (parody, artist, tag, language, category...)
-  const groupedTags = new Map();
-  for (const tag of book.tags || []) {
-    const type = tag.type || 'tag';
-    if (!groupedTags.has(type)) groupedTags.set(type, []);
-    groupedTags.get(type).push(tag);
-  }
+  const favBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: `detail-circle-btn glass-clear ${isFavorite ? 'is-fav' : ''}`,
+      'aria-label': isFavorite ? 'Bỏ yêu thích' : 'Yêu thích',
+      'aria-pressed': String(isFavorite),
+      onClick: async () => {
+        const updated = await toggleFavorite(book);
+        isFavorite = updated.isFavorite;
+        await refreshLibraryStats();
+        favBtn.classList.toggle('is-fav', isFavorite);
+        favBtn.setAttribute('aria-pressed', String(isFavorite));
+        favBtn.replaceChildren(svgIcon(isFavorite ? 'heart' : 'heartOutline', 19));
+        showToast(isFavorite ? 'Đã thêm vào Favorites.' : 'Đã bỏ khỏi Favorites.');
+      },
+    },
+    svgIcon(isFavorite ? 'heart' : 'heartOutline', 19)
+  );
 
-  const tagsSection = groupedTags.size
-    ? el(
+  const topActionRow = el(
+    'div',
+    { className: 'detail-top-bar' },
+    el(
+      'button',
+      {
+        type: 'button',
+        className: 'detail-circle-btn glass-clear',
+        'aria-label': 'Quay lại',
+        onClick: () => (window.history.length > 1 ? window.history.back() : navigate('/')),
+      },
+      svgIcon('back', 19)
+    ),
+    el('div', { className: 'detail-top-right' }, downloadBtn, favBtn)
+  );
+
+  const heroRow = el(
+    'div',
+    { className: 'detail-header-row' },
+    el(
+      'div',
+      { className: 'detail-cover-box' },
+      createMangaImg(coverUrl, title, { priority: 'high', className: 'detail-cover-img', width: 240, height: 340 })
+    ),
+    el(
+      'div',
+      { className: 'detail-meta-col' },
+      offlineFallbackUsed ? el('span', { className: 'offline-pill' }, 'Offline Cache') : null,
+      el('h1', { className: 'detail-title' }, title),
+      subTitle ? el('p', { className: 'detail-subtitle' }, subTitle) : null,
+      el(
         'div',
-        { className: 'detail-tags' },
-        ...[...groupedTags.entries()].map(([type, list]) =>
-          el(
-            'div',
-            { className: 'tag-group-row' },
-            el('span', { className: 'tag-group-label' }, type),
+        { className: 'detail-inline-stats tabular-nums' },
+        el('span', { className: 'inline-stat gold' }, svgIcon('book', 14), `${totalPages} pgs`),
+        el('span', { className: 'inline-stat pink' }, svgIcon('heart', 14), formatNumber(book.num_favorites || 0)),
+        book.upload_date ? el('span', { className: 'inline-stat muted' }, formatUnixDate(book.upload_date)) : null
+      )
+    )
+  );
+
+  const readCtaBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'read-now-cta',
+      onClick: () => navigate(`/read/${book.id}/${Math.max(1, lastReadPage || 1)}`),
+    },
+    svgIcon('play', 18),
+    lastReadPage > 0 ? `CONTINUE READING (PG ${lastReadPage})` : 'READ NOW'
+  );
+
+  const tags = book.tags || [];
+  const tagsSection = tags.length
+    ? el(
+        'section',
+        { className: 'detail-section' },
+        el(
+          'div',
+          { className: 'kinetic-section-head' },
+          el('h2', { className: 'kinetic-section-title' }, 'Tags'),
+          el('span', { className: 'tags-count-label tabular-nums' }, `(${tags.length})`)
+        ),
+        el(
+          'div',
+          { className: 'dot-tags-wrap' },
+          ...tags.map((t, i) =>
             el(
-              'div',
-              { className: 'tag-pills' },
-              ...list.map((t) =>
-                el(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'tag-chip',
-                    onClick: () => navigate(`/search?q=${encodeURIComponent(t.name || '')}`),
-                  },
-                  el('span', {}, t.name || ''),
-                  t.count ? el('span', { className: 'tag-count' }, formatNumber(t.count)) : null
-                )
-              )
+              'button',
+              {
+                type: 'button',
+                className: 'dot-tag-chip',
+                onClick: () => navigate(`/search?q=${encodeURIComponent(t.name || '')}`),
+              },
+              el('span', { className: 'tag-color-dot', style: { backgroundColor: TAG_DOT_COLORS[i % TAG_DOT_COLORS.length] }, 'aria-hidden': 'true' }),
+              el('span', {}, t.name || '')
             )
           )
         )
       )
     : null;
 
-  const detailHero = el(
-    'section',
-    { className: 'detail-hero' },
-    el(
-      'div',
-      { className: 'detail-cover-col' },
-      el(
-        'div',
-        { className: 'detail-cover-card' },
-        createMangaImg(coverUrl, title, { priority: 'high', className: 'detail-cover-img', width: 350, height: 490 })
-      )
-    ),
-    el(
-      'div',
-      { className: 'detail-info-col' },
-      offlineFallbackUsed
-        ? el('p', { className: 'offline-notice' }, 'Đang hiển thị từ bộ nhớ cache offline.')
-        : null,
-      el('div', { className: 'detail-id-line' }, el('span', { className: 'id-badge' }, `#${book.id}`), book.upload_date ? el('span', {}, formatUnixDate(book.upload_date)) : null),
-      el('h1', { className: 'detail-title' }, title),
-      subTitle ? el('p', { className: 'detail-subtitle' }, subTitle) : null,
-      el(
-        'div',
-        { className: 'detail-stats' },
-        el('span', { className: 'stat-pill' }, `${totalPages} trang`),
-        el('span', { className: 'stat-pill' }, svgIcon('heart', 14), `${formatNumber(book.num_favorites || 0)} lượt thích`),
-        book.scanlator ? el('span', { className: 'stat-pill' }, `Nhóm dịch: ${book.scanlator}`) : null
-      ),
-      el(
-        'div',
-        { className: 'detail-actions' },
-        el(
-          'button',
-          {
-            type: 'button',
-            className: 'btn btn-primary btn-lg',
-            onClick: () => navigate(`/read/${book.id}/${Math.max(1, lastReadPage || 1)}`),
-          },
-          svgIcon('book', 20),
-          lastReadPage > 1 ? `Đọc tiếp (Trang ${lastReadPage})` : 'Bắt đầu đọc'
-        ),
-        lastReadPage > 1
-          ? el(
-              'button',
-              { type: 'button', className: 'btn btn-surface', onClick: () => navigate(`/read/${book.id}/1`) },
-              'Đọc từ đầu'
-            )
-          : null,
-        favBtn,
-        downloadBtn
-      ),
-      downloadStatusEl,
-      tagsSection
-    )
-  );
-
-  // Page thumbnails preview grid
+  // Preview thumbnails
   const pagesList = book.pages || [];
-  let previewLimit = Math.min(24, pagesList.length);
+  let previewLimit = Math.min(20, pagesList.length);
   const thumbsGrid = el('div', { className: 'thumb-preview-grid' });
   const moreThumbsWrap = el('div', { className: 'load-more-host' });
 
@@ -1162,7 +1306,6 @@ async function mountDetailView(container, { id }) {
     const frag = document.createDocumentFragment();
     for (let i = 0; i < previewLimit; i++) {
       const p = pagesList[i];
-      const thumbUrl = fullThumbUrl(p.thumbnail || p.path, book.media_id);
       frag.appendChild(
         el(
           'a',
@@ -1175,8 +1318,8 @@ async function mountDetailView(container, { id }) {
               navigate(`/read/${book.id}/${p.number}`);
             },
           },
-          createMangaImg(thumbUrl, `Trang ${p.number}`, { priority: 'lazy', className: 'page-thumb-img', width: 150, height: 210 }),
-          el('span', { className: 'page-thumb-num' }, String(p.number))
+          createMangaImg(fullThumbUrl(p.thumbnail || p.path, book.media_id), `Trang ${p.number}`, { priority: 'lazy', className: 'page-thumb-img', width: 140, height: 200 }),
+          el('span', { className: 'page-thumb-num tabular-nums' }, String(p.number))
         )
       );
     }
@@ -1206,7 +1349,7 @@ async function mountDetailView(container, { id }) {
     ? el(
         'section',
         { className: 'detail-section' },
-        el('h2', { className: 'section-title' }, `Xem trước trang (${pagesList.length})`),
+        el('div', { className: 'kinetic-section-head' }, el('h2', { className: 'kinetic-section-title' }, `Preview (${pagesList.length})`)),
         thumbsGrid,
         moreThumbsWrap
       )
@@ -1215,32 +1358,25 @@ async function mountDetailView(container, { id }) {
   const relatedSection = el('section', { className: 'detail-section' });
 
   pageWrap.replaceChildren(
+    el('div', { className: 'detail-banner-wash' }, topActionRow),
     el(
       'div',
-      { className: 'breadcrumb-bar' },
-      el(
-        'button',
-        {
-          type: 'button',
-          className: 'pill-btn btn-surface',
-          onClick: () => (window.history.length > 1 ? window.history.back() : navigate('/')),
-        },
-        svgIcon('back', 16),
-        'Quay lại'
-      )
-    ),
-    detailHero,
-    previewSection,
-    relatedSection
+      { className: 'page-container detail-body-container' },
+      heroRow,
+      readCtaBtn,
+      downloadStatusEl,
+      tagsSection,
+      previewSection,
+      relatedSection
+    )
   );
 
-  // Fetch related manga asynchronously without blocking Detail render
   if (!offlineFallbackUsed) {
     fetchRelated(id, abortController.signal)
       .then((related) => {
         if (!related?.length) return;
         relatedSection.replaceChildren(
-          el('h2', { className: 'section-title' }, 'Truyện liên quan'),
+          el('div', { className: 'kinetic-section-head' }, el('h2', { className: 'kinetic-section-title' }, 'Related Manga')),
           el('div', { className: 'manga-grid' }, ...related.slice(0, 12).map((b) => buildMangaCard(b)))
         );
       })
@@ -1251,238 +1387,50 @@ async function mountDetailView(container, { id }) {
   return () => cleanups.forEach((fn) => fn());
 }
 
-// --- Gamification & Theme Settings Dialog ---
+// --- Native Web Install Button inside Drawer (install-web-app compliant) ---
 
-function renderRewardsDialogContent() {
-  const state = loadUserState();
-  updateHeaderPoints();
-  const today = getLocalDateString();
-  const alreadyCheckedInToday = state.last_check_in_date === today;
-  const storedScheme = getStoredColorScheme();
-  const sysScheme = getSystemColorScheme();
-  const sysLabel = sysScheme === 'dark' ? 'Hệ thống (đang Tối)' : 'Hệ thống (đang Sáng)';
-
-  const codeInput = el('input', {
-    type: 'text',
-    className: 'dialog-input',
-    placeholder: 'MANGA999, NHENTAI hoặc LUCKY',
-    enterkeyhint: 'done',
-    autocapitalize: 'characters',
-    autocorrect: 'off',
-    'aria-label': 'Mã quà tặng',
-  });
-
-  const feedbackMsg = el('p', { className: 'dialog-feedback', role: 'status', 'aria-live': 'polite' });
-
-  function showFeedback(res) {
-    feedbackMsg.textContent = res.message;
-    feedbackMsg.dataset.ok = String(res.ok);
-    updateHeaderPoints();
+function renderDrawerInstallControl() {
+  const slot = document.getElementById('drawer-install-slot');
+  if (!slot) return;
+  const canInstall = !isStandaloneMode() && (supportsWebInstall || Boolean(deferredInstallPrompt));
+  if (!canInstall) {
+    slot.replaceChildren();
+    return;
   }
 
-  const nextDayToClaim = [1, 2, 3, 4, 5, 6, 7].find((d) => !state.checked_in_days.includes(d)) || 1;
-
-  rewardsDialogBody.replaceChildren(
-    el(
-      'div',
-      { className: 'points-hero-card' },
-      el('span', { className: 'points-label' }, 'Điểm tích lũy của bạn'),
-      el('strong', { className: 'points-big' }, `${state.points} điểm`),
-      el('span', { className: 'points-sub' }, `${state.coupons.length} mã ưu đãi trong ví`)
-    ),
-    feedbackMsg,
-
-    // Daily Check-in
-    el(
-      'section',
-      { className: 'dialog-section' },
-      el('h3', {}, 'Điểm danh hàng ngày (+100 điểm)'),
-      el(
-        'div',
-        { className: 'checkin-grid' },
-        ...[1, 2, 3, 4, 5, 6, 7].map((day) => {
-          const claimed = state.checked_in_days.includes(day);
-          const isNext = !alreadyCheckedInToday && day === nextDayToClaim;
-          return el(
-            'button',
-            {
-              type: 'button',
-              className: `checkin-day-btn ${claimed ? 'claimed' : ''} ${isNext ? 'next-up' : ''}`,
-              disabled: claimed || alreadyCheckedInToday,
-              onClick: () => {
-                const res = checkIn(day);
-                showFeedback(res);
-                renderRewardsDialogContent();
-                showToast(res.message, res.ok ? 'success' : 'error');
-              },
-            },
-            el('span', { className: 'checkin-day-num' }, `Ngày ${day}`),
-            el('span', { className: 'checkin-day-pts' }, claimed ? 'Đã nhận' : '+100')
-          );
-        })
-      )
-    ),
-
-    // Redeem Code
-    el(
-      'section',
-      { className: 'dialog-section' },
-      el('h3', {}, 'Nhập mã quà tặng'),
-      el(
-        'form',
-        {
-          className: 'redeem-form',
-          onSubmit: (e) => {
-            e.preventDefault();
-            const res = redeemCode(codeInput.value);
-            renderRewardsDialogContent();
-            showToast(res.message, res.ok ? 'success' : 'error');
-          },
-        },
-        codeInput,
-        el('button', { type: 'submit', className: 'btn btn-primary' }, 'Áp dụng')
-      )
-    ),
-
-    // Spend Points
-    el(
-      'section',
-      { className: 'dialog-section' },
-      el('h3', {}, 'Đổi điểm lấy ưu đãi'),
-      el(
-        'div',
-        { className: 'shop-list' },
-        ...REWARD_SHOP.map((item) =>
-          el(
-            'div',
-            { className: 'shop-row' },
-            el(
-              'div',
-              {},
-              el('strong', {}, item.label),
-              el('span', { className: 'shop-cost' }, `${item.cost} điểm`)
-            ),
-            el(
-              'button',
-              {
-                type: 'button',
-                className: 'pill-btn btn-surface compact',
-                disabled: state.points < item.cost,
-                onClick: () => {
-                  const res = spendPoints(item.cost, item.name);
-                  renderRewardsDialogContent();
-                  showToast(res.message, res.ok ? 'success' : 'error');
-                },
-              },
-              'Đổi ngay'
-            )
-          )
-        )
-      )
-    ),
-
-    // Coupon wallet
-    el(
-      'section',
-      { className: 'dialog-section' },
-      el('h3', {}, `Ví mã của bạn (${state.coupons.length})`),
-      el(
-        'div',
-        { className: 'coupon-list' },
-        ...state.coupons.map((code) => el('span', { className: 'coupon-pill' }, code))
-      )
-    ),
-
-    // 3-state Color Scheme Settings (modern-web-guidance: dark-mode-toggle)
-    el(
-      'section',
-      { className: 'dialog-section' },
-      el('h3', {}, 'Giao diện hiển thị'),
-      el(
-        'div',
-        { className: 'segmented-row' },
-        ...[
-          { id: 'system', label: sysLabel },
-          { id: 'light', label: 'Sáng' },
-          { id: 'dark', label: 'Tối' },
-        ].map((opt) => {
-          const active = (opt.id === 'system' && storedScheme === null) || storedScheme === opt.id;
-          return el(
-            'button',
-            {
-              type: 'button',
-              className: `pill-btn seg-btn ${active ? 'active' : ''}`,
-              onClick: () => {
-                setColorSchemePreference(opt.id === 'system' ? null : opt.id);
-                renderRewardsDialogContent();
-              },
-            },
-            opt.label
-          );
-        })
-      )
-    ),
-
-    // Native Web Install section (shown ONLY when install API or prompt is available & not standalone)
-    buildInstallAppSection()
-  );
-}
-
-function buildInstallAppSection() {
-  const canInstall = !isStandaloneMode() && (supportsWebInstall || Boolean(deferredInstallPrompt));
-  if (!canInstall) return null;
-
-  const statusText = el('p', { className: 'setting-hint', role: 'status', 'aria-live': 'polite' });
-  const installBtn = el(
+  const btn = el(
     'button',
     {
       type: 'button',
-      className: 'btn btn-primary',
+      className: 'btn btn-primary drawer-install-btn',
       onClick: async () => {
-        if (installBtn.getAttribute('aria-disabled') === 'true') return;
-        installBtn.setAttribute('aria-disabled', 'true');
+        if (btn.getAttribute('aria-disabled') === 'true') return;
+        btn.setAttribute('aria-disabled', 'true');
         try {
           if (supportsWebInstall) {
             await navigator.install();
-            statusText.textContent = 'Đã cài đặt hoặc mở ứng dụng MangaFlow.';
-            installBtn.hidden = true;
+            showToast('Đã cài đặt hoặc mở ứng dụng MANGA.', 'success');
+            slot.replaceChildren();
           } else if (deferredInstallPrompt) {
             const promptEvent = deferredInstallPrompt;
             deferredInstallPrompt = null;
             await promptEvent.prompt();
             const { outcome } = await promptEvent.userChoice;
-            statusText.textContent =
-              outcome === 'accepted'
-                ? 'Đã thêm MangaFlow vào màn hình chính.'
-                : 'Đã hủy cài đặt.';
-            if (!deferredInstallPrompt) installBtn.hidden = true;
+            showToast(outcome === 'accepted' ? 'Đã thêm ra Màn hình chính!' : 'Đã hủy cài đặt.');
+            renderDrawerInstallControl();
           }
         } catch (err) {
-          statusText.textContent =
-            err?.name === 'AbortError'
-              ? 'Đã hủy cài đặt.'
-              : 'Không thể bắt đầu cài đặt trên trình duyệt này.';
+          showToast(err?.name === 'AbortError' ? 'Đã hủy cài đặt.' : 'Không thể cài ứng dụng.');
         } finally {
-          installBtn.removeAttribute('aria-disabled');
+          btn.removeAttribute('aria-disabled');
         }
       },
     },
-    svgIcon('download', 17),
-    'Cài ứng dụng ra màn hình chính'
+    svgIcon('download', 16),
+    'Cài ra Màn hình chính'
   );
 
-  return el(
-    'section',
-    { className: 'dialog-section' },
-    el('h3', {}, 'Ứng dụng toàn màn hình'),
-    installBtn,
-    statusText
-  );
-}
-
-function openRewardsDialog() {
-  renderRewardsDialogContent();
-  rewardsDialog.showModal();
+  slot.replaceChildren(btn);
 }
 
 // --- Router Dispatcher ---
@@ -1498,7 +1446,7 @@ async function renderRoute() {
   window.scrollTo({ top: 0, behavior: 'instant' });
   if (appStage) appStage.scrollTop = 0;
 
-  await refreshFavoriteIds();
+  await refreshLibraryStats();
 
   if (route.name === 'home') {
     activeCleanup = await mountHomeView(appMain);
@@ -1516,80 +1464,68 @@ async function renderRoute() {
 // --- Boot ---
 
 function boot() {
-  wireIosSheet(rewardsDialog);
+  wireIosSheet(appSheet);
+  document.getElementById('app-sheet-close')?.addEventListener('click', () => closeTopLayer(appSheet));
 
-  setSidebarCollapsed(loadSidebarCollapsed());
-  sidebarToggleBtn?.addEventListener('click', () => {
-    setSidebarCollapsed(!appShell.classList.contains('sidebar-collapsed'));
-  });
+  appShell.classList.toggle('sidebar-collapsed', loadSidebarCollapsed());
+  document.getElementById('menu-open-btn')?.addEventListener('click', openMobileDrawer);
+  document.getElementById('drawer-close-btn')?.addEventListener('click', closeMobileDrawer);
+  drawerScrim?.addEventListener('click', closeMobileDrawer);
 
-  document.getElementById('nav-back-btn')?.addEventListener('click', () => window.history.back());
-  document.getElementById('nav-forward-btn')?.addEventListener('click', () => window.history.forward());
-  document.getElementById('sidebar-random-btn')?.addEventListener('click', jumpToRandomManga);
-
+  // Desktop inline Spotlight search
   const toolbarSearchForm = document.getElementById('toolbar-search-form');
   const toolbarSearchInput = document.getElementById('toolbar-search-input');
   toolbarSearchForm?.addEventListener('submit', (e) => {
     e.preventDefault();
     const val = toolbarSearchInput.value.trim();
-    if (!val) {
-      navigate('/search');
-      return;
-    }
-    if (/^\d+$/.test(val)) {
-      navigate(`/manga/${val}`);
-    } else {
-      navigate(`/search?q=${encodeURIComponent(val)}`);
-    }
+    if (!val) navigate('/search');
+    else if (/^\d+$/.test(val)) navigate(`/manga/${val}`);
+    else navigate(`/search?q=${encodeURIComponent(val)}`);
     toolbarSearchInput.blur();
   });
 
-  // Register app-shell Service Worker for Home Screen standalone & offline launch
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
 
-  // Sync standalone display-mode class dynamically
   const standaloneMql = window.matchMedia('(display-mode: standalone)');
   const syncStandaloneClass = () => {
     document.documentElement.classList.toggle('is-standalone', isStandaloneMode());
+    renderDrawerInstallControl();
   };
   syncStandaloneClass();
   standaloneMql.addEventListener?.('change', syncStandaloneClass);
 
-  // Capture Chromium beforeinstallprompt fallback per install-web-app guidance
   window.addEventListener('beforeinstallprompt', (event) => {
     event.preventDefault();
     deferredInstallPrompt = event;
-    if (rewardsDialog.open) renderRewardsDialogContent();
+    renderDrawerInstallControl();
   });
 
-  // Scroll-edge & iOS Large Title collapse detection (works in both browser & standalone scroll container)
   const updateScrollChrome = () => {
     const scrollPos = Math.max(window.scrollY, appStage?.scrollTop || 0);
-    topHeader?.classList.toggle('is-scrolled', scrollPos > 24);
+    topHeader?.classList.toggle('is-scrolled', scrollPos > 160);
   };
   window.addEventListener('scroll', updateScrollChrome, { passive: true });
   appStage?.addEventListener('scroll', updateScrollChrome, { passive: true });
   updateScrollChrome();
 
-  // iOS native left-edge swipe-back gesture (crucial when Safari Back button is hidden in standalone mode)
-  let edgeSwipeStartX = 0;
-  let edgeSwipeStartY = 0;
-  let edgeSwipeActive = false;
+  // Left-edge swipe-back (nested pages) or swipe-open drawer (Home) on touch
+  let edgeStartX = 0;
+  let edgeStartY = 0;
+  let edgeTracking = false;
   document.addEventListener(
     'touchstart',
     (e) => {
       if (e.touches.length !== 1) return;
-      if (appShell.classList.contains('is-reader-route') || rewardsDialog.open) return;
-      if (e.target.closest('.carousel-track, .quick-actions, input, select')) return;
-      const x = e.touches[0].clientX;
-      if (x <= 26) {
-        edgeSwipeActive = true;
-        edgeSwipeStartX = x;
-        edgeSwipeStartY = e.touches[0].clientY;
+      if (appShell.classList.contains('is-reader-route') || appSheet.open) return;
+      if (e.target.closest('.carousel-track, .weekly-track, input, select')) return;
+      if (e.touches[0].clientX <= 26) {
+        edgeTracking = true;
+        edgeStartX = e.touches[0].clientX;
+        edgeStartY = e.touches[0].clientY;
       } else {
-        edgeSwipeActive = false;
+        edgeTracking = false;
       }
     },
     { passive: true }
@@ -1597,20 +1533,25 @@ function boot() {
   document.addEventListener(
     'touchend',
     (e) => {
-      if (!edgeSwipeActive || e.changedTouches.length !== 1) return;
-      edgeSwipeActive = false;
-      const dx = e.changedTouches[0].clientX - edgeSwipeStartX;
-      const dy = e.changedTouches[0].clientY - edgeSwipeStartY;
-      if (dx > 72 && Math.abs(dx) > Math.abs(dy) * 1.5 && window.location.pathname !== '/') {
-        window.history.back();
+      if (!edgeTracking || e.changedTouches.length !== 1) return;
+      edgeTracking = false;
+      const dx = e.changedTouches[0].clientX - edgeStartX;
+      const dy = e.changedTouches[0].clientY - edgeStartY;
+      if (dx > 72 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        if (window.location.pathname !== '/') window.history.back();
+        else openMobileDrawer();
       }
     },
     { passive: true }
   );
 
-  // macOS keyboard shortcuts (zero animation on keyboard-initiated actions)
+  // macOS / PC keyboard shortcuts
   window.addEventListener('keydown', (e) => {
-    if (rewardsDialog.open) return;
+    if (appSheet.open) return;
+    if (e.key === 'Escape' && appShell.classList.contains('drawer-open')) {
+      closeMobileDrawer();
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
       if (window.innerWidth >= 900 && toolbarSearchInput) {
@@ -1623,23 +1564,15 @@ function boot() {
     }
     if ((e.metaKey || e.ctrlKey) && e.key === '\\') {
       e.preventDefault();
-      setSidebarCollapsed(!appShell.classList.contains('sidebar-collapsed'));
+      openMobileDrawer();
     }
   });
 
-  initThemeSync(() => {
-    if (rewardsDialog.open) renderRewardsDialogContent();
-  });
-
+  initThemeSync();
   document.getElementById('theme-toggle-btn')?.addEventListener('click', () => {
     toggleColorScheme();
-    if (rewardsDialog.open) renderRewardsDialogContent();
   });
 
-  document.getElementById('rewards-open-btn')?.addEventListener('click', openRewardsDialog);
-  document.getElementById('rewards-close-btn')?.addEventListener('click', () => closeTopLayer(rewardsDialog));
-
-  // Intercept internal navigation links in sidebar, tablet nav, header & iOS tab bar
   for (const link of document.querySelectorAll('a[data-spa-link]')) {
     link.addEventListener('click', (e) => {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -1649,7 +1582,6 @@ function boot() {
   }
 
   window.addEventListener('popstate', () => renderRoute());
-  updateHeaderPoints();
   renderRoute();
 }
 

@@ -14,19 +14,19 @@ import {
 import {
   el,
   svgIcon,
-  wireIosSheet,
-  closeTopLayer,
   rubberband,
   revokeObjectUrls,
   showToast,
 } from './dom.js';
 
-const READER_THEMES = [
+const EYE_FILTERS = [
   { id: 'black', label: 'Đen tuyền', color: '#000000' },
   { id: 'charcoal', label: 'Than chì', color: '#14141A' },
   { id: 'sepia', label: 'Giấy cũ', color: '#F4ECD8' },
   { id: 'white', label: 'Trắng sáng', color: '#FFFFFF' },
 ];
+
+const AUTO_SPEEDS = [1, 2, 3, 4, 5];
 
 function createPageImg(page, mediaId, priority = 'lazy') {
   const remoteUrl = fullImageUrl(page.path, mediaId);
@@ -75,10 +75,11 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   cleanups.push(() => abortController.abort());
 
   const prefs = loadReaderPrefs();
-  let mode = prefs.mode; // 'horizontal' | 'vertical'
+  let mode = prefs.mode; // 'horizontal' (Page Flip) | 'vertical' (Webtoon)
   let theme = prefs.theme; // 'black' | 'charcoal' | 'sepia' | 'white'
-  let autoScrollSpeed = prefs.autoScrollSpeed;
+  let autoScrollSpeed = Math.min(5, Math.max(1, Number(prefs.autoScrollSpeed) || 2));
   let autoScrolling = false;
+  // Unobstructed by default: full-bleed manga reading; tap screen to open the Kinetic panel
   let hudVisible = false;
   let zoom = 1;
   let panX = 0;
@@ -98,15 +99,15 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   });
   container.replaceChildren(root);
 
-  const loadingBox = el(
-    'div',
-    { className: 'reader-status-box' },
-    el('div', { className: 'spinner', 'aria-hidden': 'true' }),
-    el('p', {}, 'Đang tải trang truyện...')
+  root.appendChild(
+    el(
+      'div',
+      { className: 'reader-status-box' },
+      el('div', { className: 'spinner', 'aria-hidden': 'true' }),
+      el('p', {}, 'Đang tải trang truyện...')
+    )
   );
-  root.appendChild(loadingBox);
 
-  // Load cached book first for instant offline reading, otherwise fetch from proxy
   try {
     const meta = await getMetadata(id);
     if (meta?.bookJson?.pages?.length) {
@@ -159,32 +160,33 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   currentPage = Math.min(totalPages, Math.max(1, currentPage));
   const titleText = getBookTitle(book);
 
-  // Build minimal, non-intrusive HUD (hidden by default; single-row liquid glass capsules when tapped)
-  const pageCounterText = el('span', { className: 'reader-counter' }, `${currentPage} / ${totalPages}`);
+  // --- Kinetic Reader Controls (00:54–01:09 reference) ---
+  const topSubCounter = el('span', { className: 'reader-counter tabular-nums' }, `Page ${currentPage} of ${totalPages}`);
+  const sliderCurNum = el('span', { className: 'reader-scrubber-cur tabular-nums' }, String(currentPage));
+  const sliderTotNum = el('span', { className: 'reader-scrubber-tot tabular-nums' }, String(totalPages));
+
   const floatingPagePill = el(
     'button',
     {
       type: 'button',
       className: 'reader-mini-pill glass-clear tabular-nums',
-      'aria-label': 'Hiện thanh điều khiển đọc truyện',
+      'aria-label': 'Hiện bảng điều khiển đọc truyện',
       onClick: () => setHudVisible(true),
     },
     `${currentPage} / ${totalPages}`
   );
 
-  const zoomResetBtn = el(
+  const autoActiveBanner = el(
     'button',
     {
       type: 'button',
-      className: 'pill-btn seg-btn',
-      'aria-label': 'Đặt lại mức thu phóng 100%',
-      onClick: () => setZoom(1),
+      className: 'reader-auto-pill',
+      hidden: true,
+      onClick: () => setAutoScrolling(false),
     },
-    '100%'
+    el('span', { className: 'auto-dot', 'aria-hidden': 'true' }),
+    el('span', { className: 'auto-pill-text' }, `Auto ${autoScrollSpeed}x · Tap to pause`)
   );
-
-  const settingsDialog = buildSettingsDialog();
-  wireIosSheet(settingsDialog);
 
   const topBar = el(
     'header',
@@ -197,23 +199,13 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         'aria-label': 'Quay lại chi tiết truyện',
         onClick: () => navigate(`/manga/${id}`),
       },
-      svgIcon('back', 18)
+      svgIcon('back', 19)
     ),
     el(
       'div',
       { className: 'reader-title-wrap' },
       el('h1', { className: 'reader-title' }, titleText),
-      pageCounterText
-    ),
-    el(
-      'button',
-      {
-        type: 'button',
-        className: 'icon-btn reader-hud-btn compact',
-        'aria-label': 'Tùy chọn đọc truyện',
-        onClick: () => settingsDialog.showModal(),
-      },
-      svgIcon('settings', 18)
+      topSubCounter
     )
   );
 
@@ -227,51 +219,126 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     onInput: (e) => goToPage(Number(e.target.value)),
   });
 
-  const autoScrollBtn = el(
+  const modeFlipBtn = el(
     'button',
     {
       type: 'button',
-      className: 'icon-btn reader-hud-btn compact',
-      'aria-label': 'Bật hoặc tắt tự động cuộn',
+      className: `kinetic-mode-btn ${mode === 'horizontal' ? 'active' : ''}`,
+      onClick: () => setMode('horizontal'),
+    },
+    'Page Flip'
+  );
+  const modeWebtoonBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: `kinetic-mode-btn ${mode === 'vertical' ? 'active' : ''}`,
+      onClick: () => setMode('vertical'),
+    },
+    'Webtoon'
+  );
+
+  const swatchButtons = EYE_FILTERS.map((f) =>
+    el('button', {
+      type: 'button',
+      className: `eye-filter-dot ${theme === f.id ? 'active' : ''}`,
+      dataset: { filterId: f.id },
+      'aria-label': `Nền đọc ${f.label}`,
+      title: f.label,
+      style: { backgroundColor: f.color },
+      onClick: () => setTheme(f.id),
+    })
+  );
+
+  const autoStatusLabel = el('span', { className: 'auto-status-text tabular-nums' }, 'Paused');
+  const autoPlayBtn = el(
+    'button',
+    {
+      type: 'button',
+      className: 'auto-play-circle',
+      'aria-label': 'Bật hoặc tắt Auto-Scroll',
       'aria-pressed': 'false',
-      title: 'Tự động cuộn (Space)',
       onClick: () => setAutoScrolling(!autoScrolling),
     },
     svgIcon('play', 17)
   );
 
-  const prevPageBtn = el(
+  const zoomResetBtn = el(
     'button',
     {
       type: 'button',
-      className: 'icon-btn reader-hud-btn compact',
-      'aria-label': 'Trang trước',
-      onClick: () => goToPage(currentPage - 1),
+      className: 'zoom-mini-btn tabular-nums',
+      'aria-label': 'Đặt lại phóng to 100%',
+      onClick: () => setZoom(1),
     },
-    svgIcon('chevronLeft', 18)
+    '100%'
   );
 
-  const nextPageBtn = el(
-    'button',
-    {
-      type: 'button',
-      className: 'icon-btn reader-hud-btn compact',
-      'aria-label': 'Trang tiếp theo',
-      onClick: () => goToPage(currentPage + 1),
-    },
-    svgIcon('chevronRight', 18)
+  const speedButtons = AUTO_SPEEDS.map((sp) =>
+    el(
+      'button',
+      {
+        type: 'button',
+        className: `speed-pill-btn ${autoScrollSpeed === sp ? 'active' : ''}`,
+        dataset: { speedVal: sp },
+        onClick: () => {
+          autoScrollSpeed = sp;
+          saveReaderPrefs({ autoScrollSpeed });
+          syncSpeedUI();
+          if (autoScrolling && mode === 'horizontal') restartHorizontalAutoTimer();
+        },
+      },
+      `${sp}x`
+    )
   );
 
-  const bottomBar = el(
+  const bottomPanel = el(
     'footer',
-    { className: 'reader-bottom-bar glass-clear' },
+    { className: 'reader-kinetic-panel glass-clear' },
     el(
       'div',
       { className: 'reader-scrubber-row' },
-      prevPageBtn,
+      sliderCurNum,
       pageSlider,
-      nextPageBtn,
-      autoScrollBtn
+      sliderTotNum
+    ),
+    el(
+      'div',
+      { className: 'kinetic-mid-row' },
+      el(
+        'div',
+        { className: 'kinetic-col' },
+        el('span', { className: 'kinetic-micro-label' }, 'READING MODE'),
+        el('div', { className: 'kinetic-mode-group' }, modeFlipBtn, modeWebtoonBtn)
+      ),
+      el(
+        'div',
+        { className: 'kinetic-col align-end' },
+        el('span', { className: 'kinetic-micro-label' }, 'EYE FILTERS'),
+        el('div', { className: 'eye-filter-row' }, ...swatchButtons)
+      )
+    ),
+    el(
+      'div',
+      { className: 'kinetic-auto-card' },
+      el(
+        'div',
+        { className: 'kinetic-auto-head' },
+        el('div', { className: 'kinetic-auto-left' }, autoPlayBtn, el('strong', {}, 'Auto-Scroll')),
+        el(
+          'div',
+          { className: 'kinetic-auto-right' },
+          el(
+            'div',
+            { className: 'zoom-mini-group', role: 'group', 'aria-label': 'Thu phóng' },
+            el('button', { type: 'button', className: 'zoom-mini-btn', 'aria-label': 'Thu nhỏ', onClick: () => setZoom(zoom - 0.25) }, '−'),
+            zoomResetBtn,
+            el('button', { type: 'button', className: 'zoom-mini-btn', 'aria-label': 'Phóng to', onClick: () => setZoom(zoom + 0.25) }, '+')
+          ),
+          autoStatusLabel
+        )
+      ),
+      el('div', { className: 'kinetic-speed-row' }, ...speedButtons)
     )
   );
 
@@ -280,173 +347,18 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     tabindex: '0',
     'aria-label': 'Khung đọc truyện',
   });
-
   const stage = el('div', { className: 'reader-stage' });
   viewport.appendChild(stage);
 
-  root.replaceChildren(topBar, viewport, floatingPagePill, bottomBar, settingsDialog);
+  root.replaceChildren(topBar, autoActiveBanner, viewport, floatingPagePill, bottomPanel);
 
-  function buildSettingsDialog() {
-    const modeButtons = [
-      { id: 'vertical', label: 'Cuộn dọc (Webtoon)' },
-      { id: 'horizontal', label: 'Lật trang ngang' },
-    ];
-
-    const speedValueLabel = el('strong', {}, `${autoScrollSpeed}x`);
-    const speedSlider = el('input', {
-      type: 'range',
-      min: '1',
-      max: '10',
-      step: '1',
-      value: String(autoScrollSpeed),
-      'aria-label': 'Tốc độ tự động cuộn',
-      onInput: (e) => {
-        autoScrollSpeed = Number(e.target.value);
-        speedValueLabel.textContent = `${autoScrollSpeed}x`;
-        saveReaderPrefs({ autoScrollSpeed });
-        if (autoScrolling && mode === 'horizontal') {
-          restartHorizontalAutoTimer();
-        }
-      },
-    });
-
-    const dialog = el(
-      'dialog',
-      {
-        className: 'app-dialog reader-settings-dialog glass-regular',
-        closedby: 'any',
-        'aria-labelledby': 'reader-settings-title',
-      },
-      el(
-        'div',
-        { className: 'sheet-drag-zone', dataset: { sheetHandle: '' } },
-        el('span', { className: 'sheet-grabber', 'aria-hidden': 'true' }),
-        el(
-          'div',
-          { className: 'dialog-header' },
-          el('h2', { id: 'reader-settings-title' }, 'Tùy chọn đọc'),
-          el(
-            'button',
-            {
-              type: 'button',
-              className: 'sheet-done-btn',
-              'aria-label': 'Xong và đóng cài đặt',
-              onClick: () => closeTopLayer(dialog),
-            },
-            'Xong'
-          )
-        )
-      ),
-      el(
-        'div',
-        { className: 'dialog-body' },
-        el(
-          'div',
-          { className: 'setting-group' },
-          el('span', { className: 'setting-label' }, 'Chế độ đọc'),
-          el(
-            'div',
-            { className: 'segmented-row', dataset: { role: 'mode-group' } },
-            ...modeButtons.map((m) =>
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: `pill-btn seg-btn ${mode === m.id ? 'active' : ''}`,
-                  dataset: { modeVal: m.id },
-                  onClick: () => setMode(m.id),
-                },
-                m.label
-              )
-            )
-          )
-        ),
-        el(
-          'div',
-          { className: 'setting-group' },
-          el('span', { className: 'setting-label' }, 'Màu nền đọc'),
-          el(
-            'div',
-            { className: 'theme-swatch-grid', dataset: { role: 'theme-group' } },
-            ...READER_THEMES.map((t) =>
-              el(
-                'button',
-                {
-                  type: 'button',
-                  className: `theme-swatch-btn ${theme === t.id ? 'active' : ''}`,
-                  dataset: { themeVal: t.id },
-                  onClick: () => setTheme(t.id),
-                },
-                el('span', {
-                  className: 'theme-swatch-dot',
-                  style: { backgroundColor: t.color },
-                  'aria-hidden': 'true',
-                }),
-                el('span', {}, t.label)
-              )
-            )
-          )
-        ),
-        el(
-          'div',
-          { className: 'setting-group' },
-          el('span', { className: 'setting-label' }, 'Thu phóng ảnh'),
-          el(
-            'div',
-            { className: 'segmented-row' },
-            el(
-              'button',
-              {
-                type: 'button',
-                className: 'pill-btn seg-btn',
-                'aria-label': 'Thu nhỏ',
-                onClick: () => setZoom(zoom - 0.25),
-              },
-              svgIcon('zoomOut', 16),
-              'Thu nhỏ'
-            ),
-            zoomResetBtn,
-            el(
-              'button',
-              {
-                type: 'button',
-                className: 'pill-btn seg-btn',
-                'aria-label': 'Phóng to',
-                onClick: () => setZoom(zoom + 0.25),
-              },
-              svgIcon('zoomIn', 16),
-              'Phóng to'
-            )
-          )
-        ),
-        el(
-          'div',
-          { className: 'setting-group' },
-          el(
-            'div',
-            { className: 'setting-label-row' },
-            el('span', { className: 'setting-label' }, 'Tốc độ tự động cuộn'),
-            speedValueLabel
-          ),
-          speedSlider
-        ),
-        el(
-          'p',
-          { className: 'setting-hint' },
-          'Chạm giữa màn hình hoặc góc số trang để mở/ẩn thanh điều khiển • Chụm 2 ngón hoặc nhấp đúp để phóng to • Phím ←/→ lật trang.'
-        )
-      )
-    );
-    return dialog;
-  }
-
-  function syncSettingsDialogUI() {
-    for (const btn of settingsDialog.querySelectorAll('[data-mode-val]')) {
-      btn.classList.toggle('active', btn.dataset.modeVal === mode);
+  function syncSpeedUI() {
+    for (const btn of speedButtons) {
+      btn.classList.toggle('active', Number(btn.dataset.speedVal) === autoScrollSpeed);
     }
-    for (const btn of settingsDialog.querySelectorAll('[data-theme-val]')) {
-      btn.classList.toggle('active', btn.dataset.themeVal === theme);
-    }
+    const pillText = autoActiveBanner.querySelector('.auto-pill-text');
+    if (pillText) pillText.textContent = `Auto ${autoScrollSpeed}x · Tap to pause`;
+    if (autoScrolling) autoStatusLabel.textContent = `${autoScrollSpeed}x Active`;
   }
 
   function setHudVisible(visible) {
@@ -459,7 +371,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     theme = nextTheme;
     root.dataset.readerTheme = theme;
     saveReaderPrefs({ theme });
-    syncSettingsDialogUI();
+    for (const btn of swatchButtons) {
+      btn.classList.toggle('active', btn.dataset.filterId === theme);
+    }
   }
 
   function applyTransform() {
@@ -483,11 +397,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   function persistCurrentPage(pageNum) {
     const clamped = Math.min(totalPages, Math.max(1, pageNum));
     currentPage = clamped;
-    pageCounterText.textContent = `${currentPage} / ${totalPages}`;
+    topSubCounter.textContent = `Page ${currentPage} of ${totalPages}`;
+    sliderCurNum.textContent = String(currentPage);
     floatingPagePill.textContent = `${currentPage} / ${totalPages}`;
     pageSlider.value = String(currentPage);
-    prevPageBtn.disabled = currentPage <= 1;
-    nextPageBtn.disabled = currentPage >= totalPages;
 
     const nextUrl = `/read/${id}/${currentPage}`;
     if (window.location.pathname !== nextUrl) {
@@ -518,28 +431,28 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     stage.replaceChildren();
     setZoom(1);
     root.dataset.mode = mode;
-    syncSettingsDialogUI();
+
+    modeFlipBtn.classList.toggle('active', mode === 'horizontal');
+    modeWebtoonBtn.classList.toggle('active', mode === 'vertical');
 
     if (mode === 'vertical') {
       const list = el('div', { className: 'reader-vertical-list' });
       pages.forEach((p, idx) => {
         const pageNum = idx + 1;
         const priority = Math.abs(pageNum - currentPage) <= 1 ? 'high' : 'lazy';
-        const fig = el(
-          'figure',
-          { className: 'reader-page-frame', dataset: { page: pageNum } },
-          createPageImg(p, book.media_id, priority)
+        list.appendChild(
+          el(
+            'figure',
+            { className: 'reader-page-frame', dataset: { page: pageNum } },
+            createPageImg(p, book.media_id, priority)
+          )
         );
-        list.appendChild(fig);
       });
       stage.appendChild(list);
 
-      // Jump to currentPage immediately after layout
       requestAnimationFrame(() => {
         const targetEl = list.querySelector(`[data-page="${currentPage}"]`);
-        if (targetEl) {
-          viewport.scrollTop = targetEl.offsetTop;
-        }
+        if (targetEl) viewport.scrollTop = targetEl.offsetTop;
       });
 
       observer = new IntersectionObserver(
@@ -552,9 +465,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
           }
           if (best) {
             const pageNum = Number(best.target.dataset.page);
-            if (pageNum && pageNum !== currentPage) {
-              persistCurrentPage(pageNum);
-            }
+            if (pageNum && pageNum !== currentPage) persistCurrentPage(pageNum);
           }
         },
         { root: viewport, threshold: [0.25, 0.55] }
@@ -569,12 +480,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     revokeObjectUrls(stage);
     const p = pages[currentPage - 1];
     if (!p) return;
-    const frame = el(
-      'div',
-      { className: 'reader-horizontal-frame' },
-      createPageImg(p, book.media_id, 'high')
+    stage.replaceChildren(
+      el('div', { className: 'reader-horizontal-frame' }, createPageImg(p, book.media_id, 'high'))
     );
-    stage.replaceChildren(frame);
   }
 
   function goToPage(targetPage) {
@@ -586,9 +494,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       renderHorizontalPage();
     } else {
       const targetEl = stage.querySelector(`[data-page="${clamped}"]`);
-      if (targetEl) {
-        viewport.scrollTo({ top: targetEl.offsetTop, behavior: 'auto' });
-      }
+      if (targetEl) viewport.scrollTo({ top: targetEl.offsetTop, behavior: 'auto' });
     }
   }
 
@@ -598,10 +504,9 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     mode = nextMode;
     saveReaderPrefs({ mode });
     renderStage();
-    showToast(mode === 'vertical' ? 'Chế độ cuộn dọc (Webtoon)' : 'Chế độ lật trang ngang');
   }
 
-  // --- Auto-scroll loop ---
+  // --- Auto-Scroll ---
   function stopAutoScrollLoops() {
     cancelAnimationFrame(rafId);
     rafId = 0;
@@ -611,12 +516,12 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
 
   function restartHorizontalAutoTimer() {
     clearInterval(horizAutoTimer);
-    const intervalMs = Math.max(1200, Math.round((8.8 - autoScrollSpeed * 0.72) * 1000));
+    const intervalMs = Math.max(1100, Math.round((6.2 - autoScrollSpeed * 0.95) * 1000));
     horizAutoTimer = setInterval(() => {
       if (!autoScrolling || mode !== 'horizontal') return;
       if (currentPage >= totalPages) {
         setAutoScrolling(false);
-        showToast('Đã đọc đến trang cuối cùng.');
+        showToast('Đã đọc đến trang cuối.');
         return;
       }
       goToPage(currentPage + 1);
@@ -628,7 +533,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     if (!lastFrameTs) lastFrameTs = ts;
     const dt = Math.min(0.08, (ts - lastFrameTs) / 1000);
     lastFrameTs = ts;
-    const pxPerSec = autoScrollSpeed * 42;
+    const pxPerSec = autoScrollSpeed * 68;
     const maxScroll = viewport.scrollHeight - viewport.clientHeight;
     if (viewport.scrollTop >= maxScroll - 2) {
       setAutoScrolling(false);
@@ -642,9 +547,13 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   function setAutoScrolling(active) {
     autoScrolling = active;
     stopAutoScrollLoops();
-    autoScrollBtn.setAttribute('aria-pressed', String(autoScrolling));
-    autoScrollBtn.classList.toggle('active', autoScrolling);
-    autoScrollBtn.replaceChildren(svgIcon(autoScrolling ? 'pause' : 'play', 17));
+    autoPlayBtn.setAttribute('aria-pressed', String(autoScrolling));
+    autoPlayBtn.classList.toggle('active', autoScrolling);
+    autoPlayBtn.replaceChildren(svgIcon(autoScrolling ? 'pause' : 'play', 17));
+    autoStatusLabel.textContent = autoScrolling ? `${autoScrollSpeed}x Active` : 'Paused';
+    autoStatusLabel.classList.toggle('active', autoScrolling);
+    autoActiveBanner.hidden = !autoScrolling;
+    syncSpeedUI();
 
     if (!autoScrolling) return;
     setHudVisible(false);
@@ -656,7 +565,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     }
   }
 
-  // --- Touch Gestures: Pinch-zoom, Pan, 1:1 Horizontal Swipe w/ Rubber-band, Double-tap ---
+  // --- Gestures: Pinch-Zoom, Pan, 1:1 Horizontal Swipe, Double-Tap, Auto-Hide on Scroll ---
   let pinchStartDist = 0;
   let pinchStartZoom = 1;
   let touchStartX = 0;
@@ -716,13 +625,12 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
         return;
       }
 
-      // Direct 1:1 horizontal page tracking with edge rubber-banding
       if (mode === 'horizontal' && (horizDragging || (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.15))) {
         e.preventDefault();
         horizDragging = true;
         const atStartEdge = currentPage <= 1 && dx > 0;
         const atEndEdge = currentPage >= totalPages && dx < 0;
-        horizDragX = (atStartEdge || atEndEdge) ? rubberband(dx, viewport.clientWidth * 0.5, 0.45) : dx;
+        horizDragX = atStartEdge || atEndEdge ? rubberband(dx, viewport.clientWidth * 0.5, 0.45) : dx;
         stage.style.transition = 'none';
         stage.style.transform = `translate3d(${horizDragX.toFixed(1)}px, 0, 0)`;
         touchSamples.push({ x: e.touches[0].clientX, t: performance.now() });
@@ -748,17 +656,17 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       const goPrev = (horizDragX > threshold || velocity > 0.35) && currentPage > 1;
 
       if (goNext || goPrev) {
+        if (hudVisible) setHudVisible(false);
         stage.style.transition = '';
         stage.style.transform = '';
         goToPage(goNext ? currentPage + 1 : currentPage - 1);
       } else {
-        // Spring-like snap back to center
-        stage.style.transition = 'transform 280ms cubic-bezier(0.23, 1, 0.32, 1)';
+        stage.style.transition = 'transform 260ms cubic-bezier(0.23, 1, 0.32, 1)';
         stage.style.transform = 'translate3d(0, 0, 0)';
         setTimeout(() => {
           stage.style.transition = '';
           stage.style.transform = '';
-        }, 280);
+        }, 260);
       }
       return;
     }
@@ -774,9 +682,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
       return;
     }
     lastTapTime = now;
-    tapTimer = setTimeout(() => {
-      handleViewportTap(tapX);
-    }, 240);
+    tapTimer = setTimeout(() => handleViewportTap(tapX), 240);
   }
 
   function handleViewportTap(clientX) {
@@ -796,7 +702,6 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     setHudVisible(!hudVisible);
   }
 
-  // Auto-hide HUD the instant user scrolls in vertical reading mode so controls never get in the way
   let lastHudScrollTop = 0;
   function onViewportScroll() {
     if (!hudVisible || mode !== 'vertical') {
@@ -808,12 +713,10 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
     }
   }
 
-  // Desktop mouse interactions: click, double-click zoom, Ctrl+wheel zoom
   let clickDelayTimer = 0;
   function onViewportClick(e) {
-    // Touch taps already handled via onTouchEnd
     if (e.pointerType === 'touch') return;
-    if (e.target.closest('button, input, dialog')) return;
+    if (e.target.closest('button, input')) return;
     if (e.detail >= 2) {
       clearTimeout(clickDelayTimer);
       setZoom(zoom > 1.1 ? 1 : 2);
@@ -832,9 +735,7 @@ export async function mountReaderView(container, { id, page: initialPage }, navi
   }
 
   function onKeyDown(e) {
-    if (settingsDialog.open) return;
     if (e.target.closest('input, textarea, select')) return;
-
     if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') {
       e.preventDefault();
       goToPage(currentPage + 1);
