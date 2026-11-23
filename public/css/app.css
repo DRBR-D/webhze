@@ -1427,6 +1427,7 @@ html.is-standalone .app-stage {
   padding-block: 0.45rem;
 }
 
+.search-back-icon,
 .search-submit-icon {
   inline-size: max(38px, var(--target-size));
   block-size: max(38px, var(--target-size));
@@ -1437,7 +1438,13 @@ html.is-standalone .app-stage {
   display: inline-grid;
   place-items: center;
   cursor: pointer;
+  flex-shrink: 0;
 }
+.search-back-icon {
+  color: var(--text-primary);
+  margin-left: -0.55rem;
+}
+.search-back-icon:active { transform: scale(0.92); }
 
 .sort-pill-row {
   display: flex;
@@ -1604,7 +1611,7 @@ html.is-standalone .app-stage {
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: linear-gradient(180deg, rgba(10, 10, 18, 0.24) 0%, rgba(10, 10, 18, 0.56) 100%);
+  background: linear-gradient(180deg, rgba(10, 10, 18, 0.22) 0%, rgba(10, 10, 18, 0.42) 68%, var(--bg) 100%);
   pointer-events: none;
 }
 
@@ -1655,7 +1662,7 @@ html.is-standalone .app-stage {
   display: grid;
   grid-template-columns: 118px minmax(0, 1fr);
   gap: 1rem;
-  align-items: end;
+  align-items: start;
   margin-bottom: 1.15rem;
 }
 
@@ -1701,6 +1708,7 @@ html.is-standalone .app-stage {
   flex-direction: column;
   gap: 0.42rem;
   min-inline-size: 0;
+  padding-top: 2.95rem;
   padding-bottom: 0.15rem;
 }
 

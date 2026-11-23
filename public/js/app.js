@@ -72,6 +72,7 @@ let cachedPopularList = [];
 // Navigation stack, scroll restoration, in-memory view caches, and hero fly-in state
 let navSeq = Math.max(1, Number(window.history.state?.navId) || 1);
 let currentNavId = navSeq;
+let restoringScroll = false;
 const scrollPositions = new Map();
 const bookMemoryCache = new Map();
 let homeCache = null;
@@ -955,6 +956,18 @@ async function mountSearchView(container, { q: initialQuery, sort: initialSort }
         syncUrlAndRun();
       },
     },
+    (Number(window.history.state?.stackIdx) || 0) > 0
+      ? el(
+          'button',
+          {
+            type: 'button',
+            className: 'search-back-icon',
+            'aria-label': 'Quay lại',
+            onClick: () => goBack('/'),
+          },
+          svgIcon('back', 19)
+        )
+      : null,
     searchInput,
     el(
       'button',
@@ -1464,16 +1477,11 @@ async function mountDetailView(container, { id }, { isPop = false, forceRefresh 
     el('div', { className: 'detail-top-right' }, downloadBtn, favBtn)
   );
 
-  // Blurred cover backdrop fades in gently behind header (never flies)
+  // Blurred cover backdrop fades in gently behind header (never flies; uses proxy/cache fallback too)
   const bannerBackdrop = initialCoverUrl
-    ? el('img', {
-        src: initialCoverUrl,
-        alt: '',
-        className: 'detail-banner-bg',
-        referrerPolicy: 'no-referrer',
-        'aria-hidden': 'true',
-      })
+    ? createMangaImg(initialCoverUrl, '', { priority: 'high', className: 'detail-banner-bg' })
     : null;
+  if (bannerBackdrop) bannerBackdrop.setAttribute('aria-hidden', 'true');
 
   const bannerWash = el(
     'div',
@@ -1773,9 +1781,13 @@ async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
     activeCleanup = null;
   }
 
+  // Lock scroll-position saving while restoring a popped route so Detail's scrollY=0 never wipes Home's saved scroll!
+  restoringScroll = isPop;
+
   if (window.history.state?.navId) {
     currentNavId = window.history.state.navId;
   }
+  const savedPopY = isPop ? (scrollPositions.get(currentNavId) || 0) : 0;
 
   const route = parseRoute(window.location.pathname, window.location.search);
   updateActiveNav(route.name);
@@ -1819,12 +1831,14 @@ async function renderRoute({ isPop = false, forceRefresh = false } = {}) {
 
   // Deterministically restore exact scroll position when going Back (Menu / Tag / Detail)
   if (isPop && route.name !== 'reader') {
-    const savedY = scrollPositions.get(currentNavId) || 0;
+    setScrollTop(savedPopY);
     requestAnimationFrame(() => {
-      setScrollTop(savedY);
+      setScrollTop(savedPopY);
+      restoringScroll = false;
       syncHeaderChromeFn?.();
     });
   } else {
+    restoringScroll = false;
     requestAnimationFrame(() => syncHeaderChromeFn?.());
   }
 }
@@ -1998,7 +2012,7 @@ function boot() {
     headerRaf = 0;
     const isHome = appShell.classList.contains('is-home-route');
     const scrollPos = getScrollTop();
-    if (!appShell.classList.contains('is-reader-route')) {
+    if (!restoringScroll && !appShell.classList.contains('is-reader-route')) {
       scrollPositions.set(currentNavId, scrollPos);
     }
     if (!isHome) {
